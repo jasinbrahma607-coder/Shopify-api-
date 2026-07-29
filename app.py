@@ -231,14 +231,38 @@ def ping():
 
 @app.route('/', methods=['GET'])
 def root():
-    return jsonify({
-        "name": "Shopify Checker API",
-        "version": "2.0",
-        "endpoints": {
-            "/shopify": "GET with ?site=&cc=&proxy=",
-            "/shopify/batch": "POST with JSON: {site, cards: [], proxies: []}"
-        }
-    })
+    return '''
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body { font-family: sans-serif; padding: 20px; background: #f5f5f5; }
+            .container { max-width: 500px; margin: auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+            input { width: 100%; padding: 10px; margin: 5px 0 15px 0; border: 1px solid #ddd; border-radius: 5px; box-sizing: border-box; }
+            button { width: 100%; padding: 12px; background: #007bff; color: white; border: none; border-radius: 5px; font-size: 16px; cursor: pointer; }
+            button:hover { background: #0056b3; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h2>Test Shopify API</h2>
+            <form action="/shopify" method="GET">
+                <label>Shop URL (e.g. https://store.myshopify.com):</label>
+                <input type="text" name="site" placeholder="https://..." required>
+                
+                <label>Card (Format: 411111111111|12|25|123):</label>
+                <input type="text" name="cc" placeholder="Card|MM|YY|CVV" required>
+                
+                <label>Proxy (Optional - ip:port):</label>
+                <input type="text" name="proxy" placeholder="ip:port">
+                
+                <button type="submit">Check Card</button>
+            </form>
+        </div>
+    </body>
+    </html>
+    '''
 
 
 if __name__ == '__main__':
