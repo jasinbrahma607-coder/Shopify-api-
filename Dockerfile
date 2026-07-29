@@ -4,7 +4,7 @@ FROM python:3.10-slim
 # Set the working directory inside the container
 WORKDIR /app
 
-# Install system dependencies required for Playwright Chromium
+# Install system dependencies required for Playwright Chromium (Debian packages)
 RUN apt-get update && apt-get install -y \
     libnss3 \
     libatk-bridge2.0-0 \
@@ -32,9 +32,6 @@ COPY . .
 
 # Install Playwright Chromium browser
 RUN python -m playwright install chromium
-
-# Install Playwright system dependencies automatically
-RUN python -m playwright install-deps
 
 # Expose the port (Railway will usually inject this)
 EXPOSE 8000
