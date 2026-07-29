@@ -15,7 +15,11 @@ RUN apt-get update && apt-get install -y \
     libxrandr2 \
     libgbm1 \
     libasound2 \
-    libxshmfence1
+    libxshmfence1 \
+    libcups2 \
+    libxfixes3 \
+    libpango-1.0-0 \
+    libcairo2
 
 # Copy the requirement file first to leverage Docker cache
 COPY requirements.txt .
@@ -28,6 +32,9 @@ COPY . .
 
 # Install Playwright Chromium browser
 RUN python -m playwright install chromium
+
+# Install Playwright system dependencies automatically
+RUN python -m playwright install-deps
 
 # Expose the port (Railway will usually inject this)
 EXPOSE 8000
