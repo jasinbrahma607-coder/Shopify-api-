@@ -1,13 +1,12 @@
 from flask import Flask, request, jsonify
 import requests
 import random
-import re
 from bs4 import BeautifulSoup
 import concurrent.futures
 
 app = Flask(__name__)
 
-# Set your desired concurrent workers here (you wanted 50)
+# Set your desired concurrent workers
 MAX_WORKERS = 50
 
 def shopify_check(card, site, proxy=None):
@@ -30,30 +29,40 @@ def shopify_check(card, site, proxy=None):
         resp = session.get(site, timeout=15)
         soup = BeautifulSoup(resp.text, 'html.parser')
         
-        # 3. Find variant ID to add to cart (FIXED 500 ERROR HERE)
-        variant_input = soup.find('input', {'name': 'id'})
-        if not variant_input:
-            return {"Response": "No variant ID found", "Price": "-", "Gateway": "Unknown"}
+        # 3. Find variant ID (FIXED: Handles Input boxes AND Dropdown Menus)
+        variant_id = None
         
-        variant_id = variant_input.get('value')
-        # This extra check prevents the 500 crash if the input exists but has no value
+        # Try finding an input box first
+        variant_input = soup.find('input', {'name': 'id'})
+        if variant_input:
+            variant_id = variant_input.get('value')
+        
+        # If not found, try finding a dropdown menu (select tag)
         if not variant_id:
-            return {"Response": "Variant ID is empty", "Price": "-", "Gateway": "Unknown"}
+            variant_select = soup.find('select', {'name': 'id'})
+            if variant_select:
+                first_option = variant_select.find('option')
+                if first_option:
+                    variant_id = first_option.get('value')
+
+        # If still not found, return error
+        if not variant_id:
+            return {"Response": "No variant ID found (Select or Input)", "Price": "-", "Gateway": "Unknown"}
         
         # 4. Add to Cart (Raw JSON API request)
         cart_url = site.rstrip('/') + '/cart/add.js'
         payload = {'id': variant_id, 'quantity': 1}
         add_resp = session.post(cart_url, json=payload, timeout=15)
         if add_resp.status_code != 200:
-            return {"Response": "Failed to add to cart", "Price": "-", "Gateway": "Unknown"}
+            return {"Response": f"Failed to add to cart (Code: {add_resp.status_code})", "Price": "-", "Gateway": "Unknown"}
 
         # 5. Go to Checkout
         checkout_resp = session.get(site.rstrip('/') + '/checkout', timeout=15)
         soup = BeautifulSoup(checkout_resp.text, 'html.parser')
+        
         auth_token_input = soup.find('input', {'name': 'authenticity_token'})
-        if not auth_token_input:
-            return {"Response": "Could not find checkout token", "Price": "-", "Gateway": "Unknown"}
-        auth_token = auth_token_input.get('value')
+        auth_token = auth_token_input.get('value') if auth_token_input else ''
+        
         checkout_url = checkout_resp.url
         
         # 6. Submit Shipping Information
@@ -71,8 +80,8 @@ def shopify_check(card, site, proxy=None):
             'step': 'contact_information'
         }
         shipping_resp = session.post(checkout_url, data=shipping_data, timeout=15)
-        if shipping_resp.status_code != 200:
-            return {"Response": "Shipping info failed", "Price": "-", "Gateway": "Unknown"}
+        if shipping_resp.status_code != 200 and shipping_resp.status_code != 302:
+            return {"Response": f"Shipping failed (Code: {shipping_resp.status_code})", "Price": "-", "Gateway": "Unknown"}
 
         # 7. Return ready status
         return {"Response": "READY_FOR_PAYMENT", "Price": "$10.00", "Gateway": "Shopify"}
@@ -83,47 +92,50 @@ def shopify_check(card, site, proxy=None):
 
 @app.route('/shopify', methods=['GET'])
 def check_single():
-    site = request.args.get('site')
-    cc = request.args.get('cc')
-    proxy = request.args.get('proxy')
-    
-    if not site or not cc:
-        return jsonify({"Response": "Missing parameters", "Price": "-", "Gateway": "Unknown"})
-    
     try:
+        site = request.args.get('site')
+        cc = request.args.get('cc')
+        proxy = request.args.get('proxy')
+        
+        if not site or not cc:
+            return jsonify({"Response": "Missing parameters", "Price": "-", "Gateway": "Unknown"})
+        
         result = shopify_check(cc, site, proxy)
+        return jsonify(result)
     except Exception as e:
-        result = {"Response": f"Error: {str(e)[:100]}", "Price": "-", "Gateway": "Unknown"}
-    
-    return jsonify(result)
+        # This safety net prevents the 500 error completely
+        return jsonify({"Response": f"CRITICAL_ERROR: {str(e)}", "Price": "-", "Gateway": "Unknown"})
 
 
 @app.route('/shopify/batch', methods=['POST'])
 def check_batch():
-    data = request.get_json()
-    if not data:
-        return jsonify({"error": "Invalid JSON"})
-    
-    site = data.get('site')
-    cards = data.get('cards', [])
-    proxies = data.get('proxies', [])
-    
-    if not site or not cards:
-        return jsonify({"error": "Missing site or cards"})
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "Invalid JSON"})
         
-    if len(cards) > 100:
-        return jsonify({"error": "Max 100 cards"})
+        site = data.get('site')
+        cards = data.get('cards', [])
+        proxies = data.get('proxies', [])
         
-    def check_single_task(card, proxy):
-        return shopify_check(card, site, proxy)
-    
-    results = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_card = {executor.submit(check_single_task, card, random.choice(proxies) if proxies else None): card for card in cards}
-        for future in concurrent.futures.as_completed(future_to_card):
-            results.append(future.result())
+        if not site or not cards:
+            return jsonify({"error": "Missing site or cards"})
             
-    return jsonify({"results": results, "total": len(results)})
+        if len(cards) > 100:
+            return jsonify({"error": "Max 100 cards"})
+            
+        def check_single_task(card, proxy):
+            return shopify_check(card, site, proxy)
+        
+        results = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            future_to_card = {executor.submit(check_single_task, card, random.choice(proxies) if proxies else None): card for card in cards}
+            for future in concurrent.futures.as_completed(future_to_card):
+                results.append(future.result())
+                
+        return jsonify({"results": results, "total": len(results)})
+    except Exception as e:
+        return jsonify({"error": f"Batch CRITICAL_ERROR: {str(e)}"})
 
 
 @app.route('/', methods=['GET'])
