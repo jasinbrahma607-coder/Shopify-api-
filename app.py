@@ -9,7 +9,7 @@ app = Flask(__name__)
 
 # This processes 1 card at a time (because browsers are heavy)
 # If you increase this, your RAM will crash. Keep it at 1 or 2.
-SEMAPHORE = asyncio.Semaphore(1)
+SEMAPHORE = asyncio.Semaphore(30)
 
 async def shopify_check(card, site, proxy=None):
     async with SEMAPHORE:
