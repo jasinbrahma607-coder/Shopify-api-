@@ -35,19 +35,48 @@ def parse_shop_url(url):
     return url.rstrip('/')
 
 def get_proxy_url(proxy):
+    """
+    Convert various proxy formats to httpx-compatible URL.
+    Supports:
+      - ip:port
+      - ip:port:user:pass
+      - user:pass@ip:port
+      - http://user:pass@ip:port
+    """
     if not proxy:
         return None
     proxy = proxy.strip()
-    if not proxy.startswith(("http://", "https://", "socks5://")):
-        proxy = "http://" + proxy
-    return proxy
+    # If it already starts with a scheme, return as-is
+    if proxy.startswith(("http://", "https://", "socks5://")):
+        return proxy
+
+    # Try to parse ip:port:user:pass or user:pass@ip:port
+    parts = proxy.split('@')
+    if len(parts) == 2:
+        # user:pass@ip:port
+        user_pass = parts[0]
+        host_port = parts[1]
+        return f"http://{user_pass}@{host_port}"
+
+    # No @, try splitting by colon
+    segments = proxy.split(':')
+    if len(segments) == 2:
+        # ip:port
+        return f"http://{proxy}"
+    elif len(segments) == 4:
+        # ip:port:user:pass
+        ip, port, user, password = segments[0], segments[1], segments[2], segments[3]
+        return f"http://{user}:{password}@{ip}:{port}"
+    else:
+        # Fallback: just prepend http://
+        return f"http://{proxy}"
 
 # ===== Ultra‑Aggressive Product Detection =====
 def get_variant_id(client, shop_url):
+    # If user set a fixed ID, use it
     if DEFAULT_VARIANT_ID:
         return DEFAULT_VARIANT_ID
 
-    # Try multiple methods
     methods = [
         lambda: _from_homepage(client, shop_url),
         lambda: _from_products_json(client, shop_url),
@@ -56,22 +85,23 @@ def get_variant_id(client, shop_url):
         lambda: _from_search(client, shop_url),
         lambda: _from_sitemap(client, shop_url),
         lambda: _from_common_handles(client, shop_url),
+        # Ultimate fallback: try product ID 1
+        lambda: "1",
     ]
 
     for method in methods:
         try:
             result = method()
             if result:
-                app.logger.info(f"Product found via {method.__name__}: {result}")
+                app.logger.info(f"Product found via {method.__name__ if hasattr(method, '__name__') else 'fallback'}: {result}")
                 return result
         except Exception as e:
-            app.logger.warning(f"{method.__name__} failed: {e}")
+            app.logger.warning(f"{method.__name__ if hasattr(method, '__name__') else 'fallback'} failed: {e}")
             continue
 
     return None
 
 def _from_homepage(client, shop_url):
-    """Parse /products/handle from home page."""
     resp = client.get(shop_url)
     if resp.status_code == 200:
         matches = re.findall(r'/products/([a-zA-Z0-9\-]+)', resp.text)
@@ -87,7 +117,6 @@ def _from_homepage(client, shop_url):
     return None
 
 def _from_products_json(client, shop_url):
-    """Try /products.json endpoint."""
     json_url = urljoin(shop_url, "/products.json")
     resp = client.get(json_url)
     if resp.status_code == 200:
@@ -100,7 +129,6 @@ def _from_products_json(client, shop_url):
     return None
 
 def _from_collections_all(client, shop_url):
-    """Try /collections/all (fallback for older stores)."""
     coll_url = urljoin(shop_url, "/collections/all")
     resp = client.get(coll_url)
     if resp.status_code == 200:
@@ -117,7 +145,6 @@ def _from_collections_all(client, shop_url):
     return None
 
 def _from_collections_all_json(client, shop_url):
-    """Try /collections/all/products.json."""
     json_url = urljoin(shop_url, "/collections/all/products.json")
     resp = client.get(json_url)
     if resp.status_code == 200:
@@ -130,12 +157,10 @@ def _from_collections_all_json(client, shop_url):
     return None
 
 def _from_search(client, shop_url):
-    """Try /search?q=*&view=json (some stores expose)."""
     search_url = urljoin(shop_url, "/search?q=*&view=json")
     resp = client.get(search_url)
     if resp.status_code == 200:
         data = resp.json()
-        # Structure may vary; try to find variants
         products = data.get("products", data.get("items", []))
         if products:
             variants = products[0].get("variants", [])
@@ -144,13 +169,11 @@ def _from_search(client, shop_url):
     return None
 
 def _from_sitemap(client, shop_url):
-    """Try /sitemap.xml or /sitemap_products_1.xml."""
     sitemaps = ["/sitemap.xml", "/sitemap_products_1.xml", "/sitemap_products_1.xml.gz"]
     for sitemap in sitemaps:
         try:
             resp = client.get(urljoin(shop_url, sitemap))
             if resp.status_code == 200:
-                # Look for product URLs
                 matches = re.findall(r'<loc>.*?/products/([a-zA-Z0-9\-]+)</loc>', resp.text)
                 if matches:
                     handle = matches[0]
@@ -166,7 +189,6 @@ def _from_sitemap(client, shop_url):
     return None
 
 def _from_common_handles(client, shop_url):
-    """Try common product handles as a last resort."""
     common_handles = ["default", "product", "main", "featured", "1", "shop"]
     for handle in common_handles:
         try:
@@ -184,6 +206,7 @@ def _from_common_handles(client, shop_url):
 # ===== Core Checkout Logic =====
 def perform_checkout(card_data, shop_url, proxy):
     proxy_url = get_proxy_url(proxy)
+    app.logger.info(f"Using proxy: {proxy_url if proxy_url else 'None'}")
     with httpx.Client(
         timeout=TIMEOUT,
         follow_redirects=True,
