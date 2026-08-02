@@ -42,52 +42,143 @@ def get_proxy_url(proxy):
         proxy = "http://" + proxy
     return proxy
 
-# ===== Improved Product Detection =====
+# ===== Ultra‑Aggressive Product Detection =====
 def get_variant_id(client, shop_url):
-    """
-    Try to find a product variant ID.
-    1. Use DEFAULT_VARIANT_ID if set.
-    2. Scrape home page for product links.
-    3. If home page fails, try the /products page directly.
-    """
     if DEFAULT_VARIANT_ID:
         return DEFAULT_VARIANT_ID
 
-    # Step 1: Home page
-    try:
-        resp = client.get(shop_url)
-        if resp.status_code == 200:
-            matches = re.findall(r'/products/([a-zA-Z0-9\-]+)', resp.text)
-            if matches:
-                handle = matches[0]
-                prod_url = urljoin(shop_url, f"/products/{handle}.js")
-                vresp = client.get(prod_url)
-                if vresp.status_code == 200:
-                    data = vresp.json()
-                    variants = data.get("variants", [])
-                    if variants:
-                        return str(variants[0]["id"])
-    except Exception as e:
-        app.logger.error(f"Home page scrape error: {e}")
+    # Try multiple methods
+    methods = [
+        lambda: _from_homepage(client, shop_url),
+        lambda: _from_products_json(client, shop_url),
+        lambda: _from_collections_all(client, shop_url),
+        lambda: _from_collections_all_json(client, shop_url),
+        lambda: _from_search(client, shop_url),
+        lambda: _from_sitemap(client, shop_url),
+        lambda: _from_common_handles(client, shop_url),
+    ]
 
-    # Step 2: Fallback to /products page
-    try:
-        fallback_url = urljoin(shop_url, "/products")
-        fresp = client.get(fallback_url)
-        if fresp.status_code == 200:
-            matches = re.findall(r'/products/([a-zA-Z0-9\-]+)', fresp.text)
-            if matches:
-                handle = matches[0]
-                prod_url = urljoin(shop_url, f"/products/{handle}.js")
-                vresp = client.get(prod_url)
-                if vresp.status_code == 200:
-                    data = vresp.json()
-                    variants = data.get("variants", [])
-                    if variants:
-                        return str(variants[0]["id"])
-    except Exception as e:
-        app.logger.error(f"Fallback product scrape error: {e}")
+    for method in methods:
+        try:
+            result = method()
+            if result:
+                app.logger.info(f"Product found via {method.__name__}: {result}")
+                return result
+        except Exception as e:
+            app.logger.warning(f"{method.__name__} failed: {e}")
+            continue
 
+    return None
+
+def _from_homepage(client, shop_url):
+    """Parse /products/handle from home page."""
+    resp = client.get(shop_url)
+    if resp.status_code == 200:
+        matches = re.findall(r'/products/([a-zA-Z0-9\-]+)', resp.text)
+        if matches:
+            handle = matches[0]
+            prod_url = urljoin(shop_url, f"/products/{handle}.js")
+            vresp = client.get(prod_url)
+            if vresp.status_code == 200:
+                data = vresp.json()
+                variants = data.get("variants", [])
+                if variants:
+                    return str(variants[0]["id"])
+    return None
+
+def _from_products_json(client, shop_url):
+    """Try /products.json endpoint."""
+    json_url = urljoin(shop_url, "/products.json")
+    resp = client.get(json_url)
+    if resp.status_code == 200:
+        data = resp.json()
+        products = data.get("products", [])
+        if products:
+            variants = products[0].get("variants", [])
+            if variants:
+                return str(variants[0]["id"])
+    return None
+
+def _from_collections_all(client, shop_url):
+    """Try /collections/all (fallback for older stores)."""
+    coll_url = urljoin(shop_url, "/collections/all")
+    resp = client.get(coll_url)
+    if resp.status_code == 200:
+        matches = re.findall(r'/products/([a-zA-Z0-9\-]+)', resp.text)
+        if matches:
+            handle = matches[0]
+            prod_url = urljoin(shop_url, f"/products/{handle}.js")
+            vresp = client.get(prod_url)
+            if vresp.status_code == 200:
+                data = vresp.json()
+                variants = data.get("variants", [])
+                if variants:
+                    return str(variants[0]["id"])
+    return None
+
+def _from_collections_all_json(client, shop_url):
+    """Try /collections/all/products.json."""
+    json_url = urljoin(shop_url, "/collections/all/products.json")
+    resp = client.get(json_url)
+    if resp.status_code == 200:
+        data = resp.json()
+        products = data.get("products", [])
+        if products:
+            variants = products[0].get("variants", [])
+            if variants:
+                return str(variants[0]["id"])
+    return None
+
+def _from_search(client, shop_url):
+    """Try /search?q=*&view=json (some stores expose)."""
+    search_url = urljoin(shop_url, "/search?q=*&view=json")
+    resp = client.get(search_url)
+    if resp.status_code == 200:
+        data = resp.json()
+        # Structure may vary; try to find variants
+        products = data.get("products", data.get("items", []))
+        if products:
+            variants = products[0].get("variants", [])
+            if variants:
+                return str(variants[0]["id"])
+    return None
+
+def _from_sitemap(client, shop_url):
+    """Try /sitemap.xml or /sitemap_products_1.xml."""
+    sitemaps = ["/sitemap.xml", "/sitemap_products_1.xml", "/sitemap_products_1.xml.gz"]
+    for sitemap in sitemaps:
+        try:
+            resp = client.get(urljoin(shop_url, sitemap))
+            if resp.status_code == 200:
+                # Look for product URLs
+                matches = re.findall(r'<loc>.*?/products/([a-zA-Z0-9\-]+)</loc>', resp.text)
+                if matches:
+                    handle = matches[0]
+                    prod_url = urljoin(shop_url, f"/products/{handle}.js")
+                    vresp = client.get(prod_url)
+                    if vresp.status_code == 200:
+                        data = vresp.json()
+                        variants = data.get("variants", [])
+                        if variants:
+                            return str(variants[0]["id"])
+        except:
+            continue
+    return None
+
+def _from_common_handles(client, shop_url):
+    """Try common product handles as a last resort."""
+    common_handles = ["default", "product", "main", "featured", "1", "shop"]
+    for handle in common_handles:
+        try:
+            prod_url = urljoin(shop_url, f"/products/{handle}.js")
+            vresp = client.get(prod_url)
+            if vresp.status_code == 200:
+                data = vresp.json()
+                variants = data.get("variants", [])
+                if variants:
+                    return str(variants[0]["id"])
+        except:
+            continue
     return None
 
 # ===== Core Checkout Logic =====
@@ -106,6 +197,7 @@ def perform_checkout(card_data, shop_url, proxy):
         # 1. Get product variant ID
         variant_id = get_variant_id(client, shop_url)
         if not variant_id:
+            app.logger.error(f"No product found for {shop_url} after all methods.")
             return {"status": "ERROR", "message": "No product found", "retryable": True}
 
         # 2. Add product to cart
