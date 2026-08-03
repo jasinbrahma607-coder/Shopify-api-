@@ -3,15 +3,20 @@ import requests
 import json
 import logging
 import re
-import random
 import time
 from datetime import datetime
+import os
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
+# =============== CONFIG ===============
+REQUEST_TIMEOUT = 20          # seconds for each HTTP request
+MAX_RETRIES = 2               # retry if we get a temporary error
+
 # =============== HELPERS ===============
 def extract_cc(text):
+    """Extract card, month, year, cvv from format: card|mm|yy|cvv"""
     pattern = r'(\d{15,16})\|(\d{2})\|(\d{2,4})\|(\d{3,4})'
     match = re.search(pattern, text)
     if match:
@@ -40,11 +45,11 @@ def get_proxy_dict(proxy_str):
         }
     return None
 
-def get_random_product_id(site):
-    """Try to fetch a product ID from the site's collection."""
+def get_random_product_id(site, session, proxy_dict):
+    """Fetch a product ID from the store's product list."""
     try:
         url = f"{site}/products.json?limit=1"
-        resp = requests.get(url, timeout=10)
+        resp = session.get(url, proxies=proxy_dict, timeout=REQUEST_TIMEOUT)
         if resp.status_code == 200:
             data = resp.json()
             if data.get('products'):
@@ -53,100 +58,71 @@ def get_random_product_id(site):
         pass
     return None
 
-def get_cart_token(site, session, proxy_dict):
-    """Get cart token from Shopify (required for checkout)."""
-    try:
-        url = f"{site}/cart.js"
-        resp = session.get(url, proxies=proxy_dict, timeout=15)
-        if resp.status_code == 200:
-            data = resp.json()
-            return data.get('token')
-    except:
-        pass
-    return None
-
 def add_to_cart(site, session, product_id, quantity=1, proxy_dict=None):
-    """Add a product to cart using product ID."""
+    """Add a product to the cart."""
     try:
         url = f"{site}/cart/add.js"
-        payload = {
-            'id': product_id,
-            'quantity': quantity
-        }
+        payload = {'id': product_id, 'quantity': quantity}
         headers = {
             'Content-Type': 'application/x-www-form-urlencoded',
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
-        resp = session.post(url, data=payload, headers=headers, proxies=proxy_dict, timeout=15)
+        resp = session.post(url, data=payload, headers=headers, proxies=proxy_dict, timeout=REQUEST_TIMEOUT)
         return resp.status_code == 200
     except:
         return False
 
 def get_checkout_url(site, session, proxy_dict):
-    """Get the checkout URL from the cart."""
+    """Get the checkout URL after adding to cart."""
     try:
+        # Sometimes the cart.js gives the checkout URL directly
         url = f"{site}/cart.js"
-        resp = session.get(url, proxies=proxy_dict, timeout=15)
+        resp = session.get(url, proxies=proxy_dict, timeout=REQUEST_TIMEOUT)
         if resp.status_code == 200:
             data = resp.json()
             if data.get('items'):
+                # Some stores have a direct checkout link
                 return f"{site}/checkout"
+        # Fallback: just return the checkout endpoint
+        return f"{site}/checkout"
+    except:
+        return f"{site}/checkout"
+
+def get_authenticity_token(session, checkout_url, proxy_dict):
+    """Extract authenticity token from checkout page."""
+    try:
+        resp = session.get(checkout_url, proxies=proxy_dict, timeout=REQUEST_TIMEOUT)
+        if resp.status_code == 200:
+            html = resp.text
+            token_match = re.search(r'name="authenticity_token" value="([^"]+)"', html)
+            if token_match:
+                return token_match.group(1)
+            # Also try to find token in URL
+            token_match2 = re.search(r'/checkout/([a-zA-Z0-9]+)', resp.url)
+            if token_match2:
+                return token_match2.group(1)
     except:
         pass
     return None
 
-def process_checkout(site, session, card, month, year, cvv, proxy_dict):
-    """
-    Attempt to process checkout with the given card.
-    Returns dict with Response, Price, Gateway.
-    """
-    # Step 1: Get checkout page to obtain authenticity token and other hidden fields
-    checkout_url = f"{site}/checkout"
-    try:
-        resp = session.get(checkout_url, proxies=proxy_dict, timeout=20)
-        if resp.status_code != 200:
-            return {
-                "Response": f"Checkout page not accessible (HTTP {resp.status_code})",
-                "Price": 0,
-                "Gateway": "Shopify Payments"
-            }
-        html = resp.text
-        # Extract authenticity token (commonly 'authenticity_token' in Shopify)
-        token_match = re.search(r'name="authenticity_token" value="([^"]+)"', html)
-        authenticity_token = token_match.group(1) if token_match else None
-        # Extract checkout token from URL (often after /checkout/)
-        checkout_token = checkout_url.split('/')[-1]
-        if not checkout_token or checkout_token == 'checkout':
-            # sometimes the token is in the URL after checkout/
-            checkout_token = re.search(r'/checkout/([a-zA-Z0-9]+)', resp.url)
-            if checkout_token:
-                checkout_token = checkout_token.group(1)
-            else:
-                checkout_token = None
-    except Exception as e:
-        return {
-            "Response": f"Failed to get checkout page: {str(e)}",
-            "Price": 0,
-            "Gateway": "Shopify Payments"
-        }
-
-    # Step 2: Submit payment
-    if checkout_token:
-        payment_url = f"{site}/checkout/{checkout_token}/payment"
+def submit_payment(site, session, card, month, year, cvv, authenticity_token, proxy_dict):
+    """Submit payment details to checkout."""
+    # Build the checkout URL with token if we have it
+    if authenticity_token and len(authenticity_token) > 10:
+        # If token is a checkout token (alphanumeric)
+        checkout_url = f"{site}/checkout/{authenticity_token}/payment"
     else:
-        payment_url = f"{site}/checkout/payment"
+        checkout_url = f"{site}/checkout/payment"
 
-    # Build payment payload (simplified)
+    # Basic payment data – some fields are required
     payload = {
-        'authenticity_token': authenticity_token,
+        'authenticity_token': authenticity_token or '',
         'checkout[credit_card][number]': card,
         'checkout[credit_card][month]': month,
         'checkout[credit_card][year]': year,
         'checkout[credit_card][verification_value]': cvv,
         'checkout[payment_gateway]': 'shopify_payments',
         'checkout[accepts_terms]': '1',
-        # Add other required fields (shipping, billing, etc.)
-        # We'll use dummy data if not provided
         'checkout[shipping_address][first_name]': 'John',
         'checkout[shipping_address][last_name]': 'Doe',
         'checkout[shipping_address][address1]': '123 Main St',
@@ -165,74 +141,45 @@ def process_checkout(site, session, card, month, year, cvv, proxy_dict):
     }
 
     try:
-        resp = session.post(payment_url, data=payload, headers=headers, proxies=proxy_dict, timeout=30)
+        resp = session.post(checkout_url, data=payload, headers=headers, proxies=proxy_dict, timeout=REQUEST_TIMEOUT)
         if resp.status_code == 200:
-            # Check response for success or error messages
-            if 'order placed' in resp.text.lower() or 'thank you' in resp.text.lower():
-                # Try to extract price
-                price_match = re.search(r'total_price["\']?\s*[:=]\s*["\']?([\d.]+)', resp.text)
+            html = resp.text
+            # Check for success indicators
+            if 'order placed' in html.lower() or 'thank you' in html.lower():
+                price_match = re.search(r'total_price["\']?\s*[:=]\s*["\']?([\d.]+)', html)
                 price = float(price_match.group(1)) if price_match else 0.0
-                return {
-                    "Response": "Order placed successfully",
-                    "Price": price,
-                    "Gateway": "Shopify Payments"
-                }
-            elif '3ds' in resp.text.lower() or '3d secure' in resp.text.lower():
-                return {
-                    "Response": "3DS_REQUIRED",
-                    "Price": 0,
-                    "Gateway": "Shopify Payments"
-                }
+                return {"status": "charged", "message": "Order placed successfully", "price": price}
+            elif '3ds' in html.lower() or '3d secure' in html.lower():
+                return {"status": "3ds", "message": "3DS_REQUIRED", "price": 0.0}
             else:
-                # Try to extract error message
-                error_match = re.search(r'<p class="error">(.*?)</p>', resp.text, re.DOTALL)
+                # Try to get error message
+                error_match = re.search(r'<p class="error">(.*?)</p>', html, re.DOTALL)
                 if error_match:
-                    error_msg = error_match.group(1).strip()
-                    return {
-                        "Response": error_msg,
-                        "Price": 0,
-                        "Gateway": "Shopify Payments"
-                    }
-                # If no specific error, return generic
-                return {
-                    "Response": "Payment failed – unknown error",
-                    "Price": 0,
-                    "Gateway": "Shopify Payments"
-                }
+                    return {"status": "declined", "message": error_match.group(1).strip(), "price": 0.0}
+                return {"status": "declined", "message": "Payment failed – unknown error", "price": 0.0}
         else:
-            return {
-                "Response": f"Payment submission failed (HTTP {resp.status_code})",
-                "Price": 0,
-                "Gateway": "Shopify Payments"
-            }
+            return {"status": "error", "message": f"HTTP {resp.status_code}", "price": 0.0}
     except Exception as e:
-        return {
-            "Response": f"Checkout error: {str(e)}",
-            "Price": 0,
-            "Gateway": "Shopify Payments"
-        }
+        return {"status": "error", "message": str(e), "price": 0.0}
 
-# =============== CORE CHECKOUT FUNCTION ===============
+# =============== MAIN CHECKOUT FUNCTION ===============
 def checkout_shopify(site, card, month, year, cvv, proxy=None):
     """
-    Full Shopify checkout flow:
-    1. Get a product ID (or use default)
-    2. Add to cart
-    3. Get checkout URL
-    4. Process payment
+    Complete Shopify checkout flow.
+    Returns dict with Response, Price, Gateway.
     """
     session = requests.Session()
     proxy_dict = get_proxy_dict(proxy) if proxy else None
 
-    # Step 1: Get product ID
-    product_id = get_random_product_id(site)
+    # 1. Get product ID
+    product_id = get_random_product_id(site, session, proxy_dict)
     if not product_id:
-        # If can't fetch, try a common product ID (some stores use 1)
+        # Fallback: try to get from cart (if already in cart) – but we don't have, so try a default product ID
+        # Many stores have a product with ID 1 or 2
         product_id = 1
-        # Attempt to get from collection
+        # Last resort: fetch from products
         try:
-            url = f"{site}/products.json?limit=1"
-            resp = requests.get(url, proxies=proxy_dict, timeout=10)
+            resp = session.get(f"{site}/products.json?limit=1", proxies=proxy_dict, timeout=REQUEST_TIMEOUT)
             if resp.status_code == 200:
                 data = resp.json()
                 if data.get('products'):
@@ -240,26 +187,29 @@ def checkout_shopify(site, card, month, year, cvv, proxy=None):
         except:
             pass
 
-    # Step 2: Add to cart
-    if not add_to_cart(site, session, product_id, quantity=1, proxy_dict=proxy_dict):
-        return {
-            "Response": "Failed to add product to cart",
-            "Price": 0,
-            "Gateway": "Shopify Payments"
-        }
+    if not product_id:
+        return {"Response": "Could not find any product", "Price": 0, "Gateway": "Shopify Payments"}
 
-    # Step 3: Get checkout URL
+    # 2. Add to cart
+    if not add_to_cart(site, session, product_id, 1, proxy_dict):
+        return {"Response": "Failed to add product to cart", "Price": 0, "Gateway": "Shopify Payments"}
+
+    # 3. Get checkout URL and authenticity token
     checkout_url = get_checkout_url(site, session, proxy_dict)
-    if not checkout_url:
-        return {
-            "Response": "Could not get checkout URL",
-            "Price": 0,
-            "Gateway": "Shopify Payments"
-        }
+    token = get_authenticity_token(session, checkout_url, proxy_dict)
 
-    # Step 4: Process checkout
-    result = process_checkout(site, session, card, month, year, cvv, proxy_dict)
-    return result
+    # 4. Submit payment
+    result = submit_payment(site, session, card, month, year, cvv, token, proxy_dict)
+
+    # Map result to expected format
+    if result['status'] == 'charged':
+        return {"Response": result['message'], "Price": result['price'], "Gateway": "Shopify Payments"}
+    elif result['status'] == '3ds':
+        return {"Response": "3DS_REQUIRED", "Price": 0, "Gateway": "Shopify Payments"}
+    elif result['status'] == 'declined':
+        return {"Response": result['message'], "Price": 0, "Gateway": "Shopify Payments"}
+    else:
+        return {"Response": f"ERROR: {result['message']}", "Price": 0, "Gateway": "Shopify Payments"}
 
 # =============== API ENDPOINT ===============
 @app.route('/shopify', methods=['GET'])
@@ -288,7 +238,7 @@ def shopify_check():
 
     try:
         result = checkout_shopify(site, card, month, year, cvv, proxy)
-        # Ensure result has required keys
+        # Ensure required keys
         result.setdefault('Response', 'Unknown')
         result.setdefault('Price', 0.0)
         result.setdefault('Gateway', 'Shopify Payments')
@@ -296,7 +246,7 @@ def shopify_check():
     except Exception as e:
         app.logger.error(f"Checkout error: {e}")
         return jsonify({
-            "Response": f"ERROR: Internal server error – {str(e)}",
+            "Response": f"ERROR: {str(e)}",
             "Price": 0,
             "Gateway": "Shopify Payments"
         }), 500
@@ -306,8 +256,7 @@ def shopify_check():
 def ping():
     return jsonify({"status": "alive", "time": datetime.now().isoformat()})
 
-# =============== RUN THE SERVER ===============
+# =============== RUN ===============
 if __name__ == '__main__':
-    import os
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
