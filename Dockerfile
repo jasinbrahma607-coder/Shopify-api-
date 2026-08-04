@@ -1,7 +1,7 @@
-# Use Python 3.11 (has wheels for greenlet, no compilation issues)
+# Use Python 3.11 with all common libraries
 FROM python:3.11-slim
 
-# Install system dependencies required by Playwright
+# Install Playwright's system dependencies
 RUN apt-get update && apt-get install -y \
     libnss3 \
     libatk-bridge2.0-0 \
@@ -9,25 +9,22 @@ RUN apt-get update && apt-get install -y \
     libxkbcommon0 \
     libgbm1 \
     libasound2 \
-    wget \
-    gnupg \
     && rm -rf /var/lib/apt/lists/*
-
-# Set environment variables for Playwright
-ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
-    PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 
 WORKDIR /app
 
-# Copy requirements first for better caching
+# Copy requirements and install
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Now install Playwright browsers (will download to /ms-playwright)
+# Install Chromium browser (Playwright will download to default location)
 RUN playwright install chromium
 
-# Copy the application
+# Copy the app
 COPY api.py .
 
-# Run with gunicorn
-CMD ["gunicorn", "--bind", "0.0.0.0:${PORT:-8080}", "api:app"]
+# Expose port (Railway sets PORT env)
+EXPOSE 8080
+
+# Run directly with Python (not gunicorn) for simplicity and to see errors
+CMD ["python", "api.py"]
