@@ -1,6 +1,7 @@
 import os
 import re
 import asyncio
+import traceback
 from flask import Flask, request, jsonify
 from playwright.async_api import async_playwright, TimeoutError
 
@@ -16,72 +17,59 @@ def extract_cc(text):
     return None, None, None, None
 
 async def perform_checkout(site, card, month, year, cvv):
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=['--no-sandbox', '--disable-setuid-sandbox']
-        )
-        page = await browser.new_page()
-        try:
-            # Go to homepage and then checkout
-            await page.goto(site, timeout=15000, wait_until='domcontentloaded')
-            await page.goto(f"{site}/checkout", timeout=30000, wait_until='networkidle')
-
-            # Fill card details (common Shopify selectors)
-            await page.fill('input[name="checkout[credit_card][number]"]', card)
-            await page.fill('input[name="checkout[credit_card][month]"]', month)
-            await page.fill('input[name="checkout[credit_card][year]"]', year)
-            await page.fill('input[name="checkout[credit_card][verification_value]"]', cvv)
-
-            # Click the pay button
-            await page.click('button[type="submit"]')
-            await page.wait_for_timeout(8000)  # let payment process
-
-            # Analyze result
-            url = page.url
-            content = await page.content()
-            lower = content.lower()
-
-            if 'thank_you' in url.lower() or 'order' in url.lower():
-                price_match = re.search(r'<span[^>]*data-total-price[^>]*>([\d.]+)</span>', content)
-                price = float(price_match.group(1)) if price_match else 0.0
-                return {"Response": "Order placed", "Price": price, "Gateway": "Shopify"}
-
-            elif any(x in lower for x in ['3d', 'authenticate', 'verification required', 'challenge']):
-                return {"Response": "3DS_REQUIRED", "Price": 0, "Gateway": "Shopify"}
-
-            else:
-                error_match = re.search(r'<p[^>]*class="error"[^>]*>(.*?)</p>', content, re.DOTALL)
-                if error_match:
-                    return {"Response": error_match.group(1).strip(), "Price": 0, "Gateway": "Shopify"}
-                return {"Response": "Declined", "Price": 0, "Gateway": "Shopify"}
-
-        except TimeoutError:
-            return {"Response": "Timeout – store may be blocked", "Price": 0, "Gateway": "Shopify"}
-        except Exception as e:
-            return {"Response": f"Error: {str(e)[:80]}", "Price": 0, "Gateway": "Shopify"}
-        finally:
-            await browser.close()
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=['--no-sandbox', '--disable-setuid-sandbox']
+            )
+            page = await browser.new_page()
+            try:
+                await page.goto(site, timeout=15000, wait_until='domcontentloaded')
+                await page.goto(f"{site}/checkout", timeout=30000, wait_until='networkidle')
+                await page.fill('input[name="checkout[credit_card][number]"]', card)
+                await page.fill('input[name="checkout[credit_card][month]"]', month)
+                await page.fill('input[name="checkout[credit_card][year]"]', year)
+                await page.fill('input[name="checkout[credit_card][verification_value]"]', cvv)
+                await page.click('button[type="submit"]')
+                await page.wait_for_timeout(8000)
+                url = page.url
+                content = await page.content()
+                if 'thank_you' in url.lower() or 'order' in url.lower():
+                    price_match = re.search(r'<span[^>]*data-total-price[^>]*>([\d.]+)</span>', content)
+                    price = float(price_match.group(1)) if price_match else 0.0
+                    return {"Response": "Order placed", "Price": price, "Gateway": "Shopify"}
+                elif any(x in content.lower() for x in ['3d', 'authenticate', 'verification required']):
+                    return {"Response": "3DS_REQUIRED", "Price": 0, "Gateway": "Shopify"}
+                else:
+                    error_match = re.search(r'<p[^>]*class="error"[^>]*>(.*?)</p>', content, re.DOTALL)
+                    msg = error_match.group(1).strip() if error_match else "Declined"
+                    return {"Response": msg, "Price": 0, "Gateway": "Shopify"}
+            except Exception as e:
+                return {"Response": f"Checkout error: {str(e)[:100]}", "Price": 0, "Gateway": "Shopify"}
+            finally:
+                await browser.close()
+    except Exception as e:
+        return {"Response": f"Playwright launch error: {str(e)[:100]}", "Price": 0, "Gateway": "Shopify"}
 
 @app.route('/shopify', methods=['GET'])
 def shopify():
-    site = request.args.get('site')
-    cc = request.args.get('cc')
-    if not site or not cc:
-        return jsonify({"Response": "Missing site or cc", "Price": 0, "Gateway": "Shopify"}), 400
-
-    card, month, year, cvv = extract_cc(cc)
-    if not card:
-        return jsonify({"Response": "Invalid card format", "Price": 0, "Gateway": "Shopify"}), 400
-
-    if not site.startswith('http'):
-        site = 'https://' + site
-
     try:
+        site = request.args.get('site')
+        cc = request.args.get('cc')
+        if not site or not cc:
+            return jsonify({"Response": "Missing site/cc", "Price": 0, "Gateway": "Shopify"}), 200
+        card, month, year, cvv = extract_cc(cc)
+        if not card:
+            return jsonify({"Response": "Invalid card format", "Price": 0, "Gateway": "Shopify"}), 200
+        if not site.startswith('http'):
+            site = 'https://' + site
         result = asyncio.run(perform_checkout(site, card, month, year, cvv))
         return jsonify(result)
     except Exception as e:
-        return jsonify({"Response": f"Server error: {str(e)[:80]}", "Price": 0, "Gateway": "Shopify"}), 500
+        # Return the error as JSON instead of 500
+        error_msg = str(e)
+        return jsonify({"Response": f"Server error: {error_msg[:100]}", "Price": 0, "Gateway": "Shopify"})
 
 @app.route('/health')
 def health():
