@@ -2,6 +2,7 @@ FROM python:3.13-slim
 
 WORKDIR /app
 
+# Install system dependencies (including g++ for compiling greenlet)
 RUN apt-get update && apt-get install -y \
     libnss3 \
     libatk-bridge2.0-0 \
@@ -9,6 +10,9 @@ RUN apt-get update && apt-get install -y \
     libxkbcommon0 \
     libgbm1 \
     libasound2 \
+    g++ \
+    build-essential \
+    python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
