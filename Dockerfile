@@ -1,13 +1,11 @@
-FROM mcr.microsoft.com/playwright:latest
-
-RUN apt-get update && apt-get install -y python3-pip && rm -rf /var/lib/apt/lists/*
+FROM python:3.11-slim
 
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip3 install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY api.py .
 
-# ✅ Shell form: $PORT will be expanded correctly
-CMD gunicorn --bind 0.0.0.0:${PORT:-8080} --workers=1 --timeout=120 api:app
+# Port 8080 is fixed – no variable expansion issues
+CMD gunicorn --bind 0.0.0.0:8080 --workers=1 api:app
