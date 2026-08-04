@@ -1,26 +1,14 @@
-FROM python:3.13-slim
+# Use the official Playwright Python image
+FROM mcr.microsoft.com/playwright:python-3.11
 
 WORKDIR /app
 
-# Install system dependencies (including g++ for compiling greenlet)
-RUN apt-get update && apt-get install -y \
-    libnss3 \
-    libatk-bridge2.0-0 \
-    libdrm2 \
-    libxkbcommon0 \
-    libgbm1 \
-    libasound2 \
-    g++ \
-    build-essential \
-    python3-dev \
-    && rm -rf /var/lib/apt/lists/*
-
+# Copy requirements and install Python packages
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright Chromium
-RUN playwright install chromium
-
+# Copy the application code
 COPY api.py .
 
+# Run with gunicorn
 CMD ["gunicorn", "--bind", "0.0.0.0:${PORT:-8080}", "api:app"]
