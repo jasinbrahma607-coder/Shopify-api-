@@ -1,30 +1,16 @@
-# Use Python 3.11 with all common libraries
-FROM python:3.11-slim
+FROM mcr.microsoft.com/playwright:latest
 
-# Install Playwright's system dependencies
-RUN apt-get update && apt-get install -y \
-    libnss3 \
-    libatk-bridge2.0-0 \
-    libdrm2 \
-    libxkbcommon0 \
-    libgbm1 \
-    libasound2 \
-    && rm -rf /var/lib/apt/lists/*
+# Install Python pip (the image has Python but not pip)
+RUN apt-get update && apt-get install -y python3-pip && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 # Copy requirements and install
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Install Chromium browser (Playwright will download to default location)
-RUN playwright install chromium
+RUN pip3 install --no-cache-dir -r requirements.txt
 
 # Copy the app
 COPY api.py .
 
-# Expose port (Railway sets PORT env)
-EXPOSE 8080
-
-# Run directly with Python (not gunicorn) for simplicity and to see errors
-CMD ["python", "api.py"]
+# Run with gunicorn (use python3 explicitly)
+CMD ["gunicorn", "--bind", "0.0.0.0:${PORT:-8080}", "--workers=1", "--timeout=120", "api:app"]
