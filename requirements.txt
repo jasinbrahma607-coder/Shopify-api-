@@ -1,5 +1,6 @@
 flask==3.0.0
 gunicorn==26.0.0
+# Playwright is already installed in the base image, but we need the Python package
+# The base image includes it, but to be safe we can include it anyway:
 playwright==1.42.0
-# playwright-stealth is optional – remove if you don't need it
-# playwright-stealth==2.0.3
+# playwright-stealth is optional – skip it to avoid issues
