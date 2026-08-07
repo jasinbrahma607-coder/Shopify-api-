@@ -5,8 +5,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY api.py .
+COPY . .
 
-EXPOSE 8080
+ENV PORT=8080
+EXPOSE $PORT
 
-CMD ["gunicorn", "--bind", "0.0.0.0:8080", "api:app"]
+CMD ["python", "api.py"]
