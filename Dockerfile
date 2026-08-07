@@ -15,4 +15,5 @@ COPY . .
 ENV PORT=8080
 EXPOSE $PORT
 
-CMD ["python", "api.py"]
+# Use gunicorn to serve the app
+CMD ["gunicorn", "-b", "0.0.0.0:8080", "api:app"]
