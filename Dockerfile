@@ -12,5 +12,4 @@ COPY . .
 ENV PORT=8080
 EXPOSE $PORT
 
-# Run directly – no gunicorn
 CMD ["python", "api.py"]
