@@ -13,4 +13,5 @@ COPY . .
 ENV PORT=8080
 EXPOSE $PORT
 
-CMD ["gunicorn", "api:app", "--bind", "0.0.0.0:$PORT", "--workers", "4", "--threads", "4"]
+# ✅ Fixed: shell form expands $PORT correctly
+CMD gunicorn api:app --bind 0.0.0.0:$PORT --workers 4 --threads 4
