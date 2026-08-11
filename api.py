@@ -22,7 +22,7 @@ class CheckRequest(BaseModel):
     proxy: Optional[str] = None
 
 class CheckResponse(BaseModel):
-    status: str
+    status: str        # "Charged", "Approved", "3DS", "Dead", "Error"
     message: str
     price: str
     gateway: str = "Shopify"
