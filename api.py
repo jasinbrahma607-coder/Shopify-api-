@@ -1,4 +1,4 @@
-# shopify_checker_api.py – Fast Shopify Card Checker
+# api.py – Fast Shopify Card Checker (No HTTP/2 dependency)
 import os
 import re
 import json
@@ -14,11 +14,10 @@ from fastapi.responses import JSONResponse
 
 app = FastAPI(title="Shopify Checker API")
 
-# ─── HTTP client with connection pooling ─────────────────────────────
+# ─── HTTP client with connection pooling (HTTP/1.1 only) ──────────
 client = httpx.AsyncClient(
     timeout=httpx.Timeout(30.0, connect=10.0),
     limits=httpx.Limits(max_keepalive_connections=100, max_connections=200),
-    http2=True,
     follow_redirects=True,
 )
 
