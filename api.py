@@ -240,7 +240,5 @@ def server_error(e):
 
 # ================= RUN SERVER (RAILWAY COMPATIBLE) =================
 if __name__ == '__main__':
-    # Railway sets the PORT environment variable. Default to 5000 for local testing.
     port = int(os.environ.get('PORT', 5000))
-    app.logger.info(f"Starting server on port {port} (Simulation Mode)")
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
