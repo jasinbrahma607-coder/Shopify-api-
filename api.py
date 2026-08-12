@@ -1,192 +1,156 @@
 import os
-import re
-import random
+import asyncio
+import concurrent.futures
+import functools
 import logging
-import requests
-from flask import Flask, request, jsonify
-from datetime import datetime
+import time
+from typing import Optional, Tuple
+from fastapi import FastAPI, Query
+from pydantic import BaseModel
 
-# ================= CONFIGURATION =================
-app = Flask(__name__)
+# Import the real checkout engine
+from checkout_engine import (
+    run_checkout_for_card,
+    normalize_proxy,
+    parse_card_entry,
+)
 
-# Enable logging for Railway console
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# ==================== CONFIG ====================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("vxo.api")
 
-# ================= BIN DATABASE (For realistic simulation) =================
-BIN_INFO = {
-    "4": {"brand": "Visa", "type": "Credit", "level": "Classic"},
-    "5": {"brand": "Mastercard", "type": "Credit", "level": "Standard"},
-    "34": {"brand": "Amex", "type": "Credit", "level": "Gold"},
-    "37": {"brand": "Amex", "type": "Credit", "level": "Platinum"},
-    "6": {"brand": "Discover", "type": "Credit", "level": "Cashback"},
-    "2": {"brand": "Mastercard", "type": "Debit", "level": "Standard"},
-    "3": {"brand": "Amex", "type": "Credit", "level": "Business"},
-}
+THREAD_WORKERS = int(os.environ.get("CHECKER_THREADS", "200"))
+MAX_RETRIES = int(os.environ.get("CHECKER_RETRIES", "1"))
 
-def get_bin_details(card_number):
-    """Identify card brand based on first digits."""
-    if not card_number or len(card_number) < 6:
-        return "Unknown", "Credit", "Standard"
-    for prefix, details in BIN_INFO.items():
-        if card_number.startswith(prefix):
-            return details["brand"], details["type"], details["level"]
-    return "Unknown", "Credit", "Standard"
+_pool = concurrent.futures.ThreadPoolExecutor(
+    max_workers=THREAD_WORKERS,
+    thread_name_prefix="chk",
+)
 
-# ================= SMART SIMULATION LOGIC =================
-def simulate_check(card, site, proxy=None):
-    """
-    Returns a realistic JSON response for the Telegram bot.
-    FORCES 'Charged' when the test card is used (for /addsites).
-    """
-    card_num = card.split('|')[0] if '|' in card else card
-    brand, card_type, level = get_bin_details(card_num)
-    
-    # ============================================================
-    # CRITICAL FIX: If the bot uses the test card for /addsites,
-    # force "Charged" so all sites get added to sites.txt.
-    # ============================================================
-    if card == "4111111111111111|12|2026|123":
-        app.logger.info(f"✅ TEST CARD DETECTED! Forcing 'Charged' for site: {site}")
-        return {
-            "Response": "✅ Order placed successfully. Thank you!",
-            "Price": "1.00",
-            "Gateway": "Shopify",
-            "Status": "Charged",   # <-- THIS IS WHAT YOUR BOT NEEDS
-            "BIN_Brand": "Visa",
-            "BIN_Type": "Credit",
-            "BIN_Level": "Classic"
-        }
+app = FastAPI(
+    title="ZERO CHECK API",
+    description="Real Shopify checkout engine",
+    version="2.0.0",
+    docs_url=None,
+    redoc_url=None,
+)
 
-    # Normal random simulation for real cards (when users run /sh)
-    roll = random.random()
-    
-    if roll < 0.05:  # 5% Charged
-        price = f"{random.randint(1, 99)}.{random.choice([99, 50, 00])}"
-        response_text = f"✅ Order placed successfully. Thank you! (BIN: {brand} {level})"
-        status = "Charged"
-    elif roll < 0.12:  # 7% 3DS
-        price = "0.00"
-        response_text = f"🔐 3D Secure verification required. Redirecting to bank."
-        status = "3DS"
-    elif roll < 0.20:  # 8% Approved
-        price = "0.00"
-        response_text = f"✅ Approved. Insufficient funds in account."
-        status = "Approved"
-    else:  # 80% Dead / Declined
-        decline_reasons = [
-            "❌ Card declined. Do Not Honor.",
-            "❌ Generic decline. Transaction not permitted.",
-            "❌ Stolen card reported.",
-            "❌ Expired card detected.",
-            "❌ Invalid card number."
-        ]
-        response_text = random.choice(decline_reasons)
-        price = "0.00"
-        status = "Dead"
+# ==================== MODELS ====================
+class CheckRequest(BaseModel):
+    card: Optional[str] = None
+    shop_url: Optional[str] = None
+    proxy: Optional[str] = None
+    low: bool = True
 
-    app.logger.info(f"SIM: {card[:8]}... | Site: {site} | Status: {status}")
-    
+# ==================== HELPERS ====================
+def _validate_proxy(raw: str) -> Optional[str]:
+    if not raw or not raw.strip():
+        return None
+    try:
+        return normalize_proxy(raw)
+    except Exception:
+        return None
+
+def _validate_card(raw: str) -> Tuple[Optional[str], Optional[str]]:
+    if not raw or not raw.strip():
+        return None, "Card required"
+    try:
+        parse_card_entry(raw)
+        return raw, None
+    except Exception as e:
+        return None, str(e)
+
+def _build_response(res, shop_url: str = ""):
+    status_name = res.status.name
     return {
-        "Response": response_text,
-        "Price": price,
-        "Gateway": "Shopify",
-        "Status": status,  # <-- THIS MUST BE INCLUDED
-        "BIN_Brand": brand,
-        "BIN_Type": card_type,
-        "BIN_Level": level
+        "Response": status_name,
+        "CC": res.card or "",
+        "Price": res.amount or "0.00",
+        "Gate": "Shopify",
+        "Charged": "True" if status_name == "CHARGED" else "False",
+        "error": str(res.error) if res.error else "",
+        "retryable": res.retryable,
+        "receipt_url": res.receipt_url or "",
     }
 
-# ================= FLASK ENDPOINT =================
-@app.route('/shopify/check', methods=['GET', 'POST'])
-def check_card():
-    """
-    MAIN API ENDPOINT.
-    Accepts GET or POST with query params or form data.
-    Parameters: site, cc, proxy (optional)
-    """
-    # Get parameters from GET or POST
-    if request.method == 'GET':
-        site = request.args.get('site')
-        cc = request.args.get('cc')
-        proxy_str = request.args.get('proxy')
-    else:
-        site = request.form.get('site')
-        cc = request.form.get('cc')
-        proxy_str = request.form.get('proxy')
+# ==================== ENDPOINTS ====================
 
-    # --- VALIDATION ---
-    if not site or not cc:
-        return jsonify({
-            "Response": "❌ Missing required parameters: site and cc",
-            "Price": "0",
-            "Gateway": "Shopify"
-        }), 400
+@app.get("/health", tags=["meta"])
+async def health():
+    return {
+        "ok": True,
+        "threads": THREAD_WORKERS,
+        "retries": MAX_RETRIES,
+        "status": "running"
+    }
 
-    # Clean site (remove http/https)
-    site = site.replace('https://', '').replace('http://', '').rstrip('/')
+@app.get("/check", tags=["check"])
+async def check_get(
+    card: str = Query(..., description="Card: number|mm|yyyy|cvv"),
+    url: str = Query(..., description="Shopify store URL (e.g., https://store.myshopify.com)"),
+    proxy: str = Query(..., description="Proxy: http://user:pass@host:port"),
+    low: str = Query("true", description="true = prefer products under $5"),
+):
+    """Check a card via GET query parameters."""
+    card_val, err = _validate_card(card)
+    if err:
+        return {"Response": "ERROR", "CC": card, "Price": "0.00", "Gate": "Shopify", "Charged": "False", "error": err}
     
-    # Validate CC format (card|mm|yyyy|cvv)
-    card_parts = cc.split('|')
-    if len(card_parts) != 4:
-        return jsonify({
-            "Response": "❌ Invalid CC format. Use card|mm|yyyy|cvv",
-            "Price": "0",
-            "Gateway": "Shopify"
-        }), 400
-
-    # Validate card number is numeric
-    if not card_parts[0].isdigit():
-        return jsonify({
-            "Response": "❌ Invalid card number (must be digits only)",
-            "Price": "0",
-            "Gateway": "Shopify"
-        }), 400
-
-    # --- PROXY LOGGING (Optional) ---
-    if proxy_str:
-        app.logger.info(f"Proxy provided: {proxy_str[:30]}...")
-    else:
-        app.logger.info("No proxy provided, using direct connection.")
-
-    # ============================================================
-    # SIMULATION MODE (100% Instant, Realistic Random Results)
-    # ============================================================
-    result = simulate_check(cc, site, proxy_str)
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
     
-    # CRITICAL: Return the 'status' field so the bot can add sites!
-    return jsonify({
-        "Response": result["Response"],
-        "Price": result["Price"],
-        "Gateway": result["Gateway"],
-        "status": result["Status"]  # <-- Lowercase 'status' as bot expects
-    })
+    proxy_val = _validate_proxy(proxy)
+    if not proxy_val:
+        return {"Response": "ERROR", "CC": card, "Price": "0.00", "Gate": "Shopify", "Charged": "False", "error": "Invalid proxy format"}
 
-# ================= HEALTH CHECK =================
-@app.route('/', methods=['GET'])
-def home():
-    return jsonify({
-        "status": "alive",
-        "message": "Shopify Checker API v2.0 is running",
-        "endpoint": "/shopify/check?site=domain.com&cc=card|mm|yyyy|cvv&proxy=optional",
-        "timestamp": datetime.now().isoformat()
-    })
+    low_mode = low.strip().lower() in ("1", "true", "yes")
+    
+    loop = asyncio.get_event_loop()
+    fn = functools.partial(run_checkout_for_card, url, card_val, proxy_val, low_mode)
+    res = await loop.run_in_executor(_pool, fn)
+    return _build_response(res, url)
 
-@app.route('/ping', methods=['GET'])
-def ping():
-    return jsonify({"status": "ok", "timestamp": datetime.now().isoformat()})
+@app.post("/check", tags=["check"])
+async def check_post(req: CheckRequest):
+    """Check a card via POST JSON body."""
+    card_val, err = _validate_card(req.card)
+    if err:
+        return {"Response": "ERROR", "CC": req.card or "", "Price": "0.00", "Gate": "Shopify", "Charged": "False", "error": err}
+    
+    url = req.shop_url
+    if not url:
+        return {"Response": "ERROR", "CC": req.card or "", "Price": "0.00", "Gate": "Shopify", "Charged": "False", "error": "shop_url required"}
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    
+    proxy_val = _validate_proxy(req.proxy)
+    if not proxy_val:
+        return {"Response": "ERROR", "CC": req.card, "Price": "0.00", "Gate": "Shopify", "Charged": "False", "error": "Invalid proxy format"}
 
-# ================= ERROR HANDLERS =================
-@app.errorhandler(404)
-def not_found(e):
-    return jsonify({"Response": "❌ Endpoint not found. Use /shopify/check", "Price": "0"}), 404
+    loop = asyncio.get_event_loop()
+    fn = functools.partial(run_checkout_for_card, url, card_val, proxy_val, req.low)
+    res = await loop.run_in_executor(_pool, fn)
+    return _build_response(res, url)
 
-@app.errorhandler(500)
-def server_error(e):
-    return jsonify({"Response": "⚠️ Internal server error", "Price": "0"}), 500
+@app.get("/", tags=["meta"])
+async def root():
+    return {
+        "service": "ZERO CHECK API",
+        "version": "2.0.0",
+        "endpoints": {
+            "health": "/health",
+            "check": "/check?card=CARD&url=STORE&proxy=PROXY&low=true",
+            "docs": "/docs (disabled)"
+        }
+    }
 
-# ================= RUN SERVER (RAILWAY COMPATIBLE) =================
-if __name__ == '__main__':
-    # Railway sets the PORT environment variable. Default to 5000 for local testing.
-    port = int(os.environ.get('PORT', 5000))
-    app.logger.info(f"Starting server on port {port} (Simulation Mode)")
-    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
+# ==================== RUN ====================
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", "8000"))
+    logger.info(f"🚀 ZERO CHECK API starting on port {port} (threads={THREAD_WORKERS})")
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
