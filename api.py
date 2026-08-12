@@ -1,4 +1,4 @@
-# api.py – Fast Shopify Card Checker (No HTTP/2 dependency)
+# api.py – Fast Shopify Card Checker (Clean Lifespan)
 import os
 import re
 import json
@@ -6,15 +6,24 @@ import random
 import asyncio
 import time
 from typing import Optional
-from urllib.parse import urlencode, urljoin
+from urllib.parse import urljoin
+from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import JSONResponse
 
-app = FastAPI(title="Shopify Checker API")
+# ─── Lifespan for proper shutdown ──────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: nothing needed
+    yield
+    # Shutdown: close HTTP client
+    await client.aclose()
 
-# ─── HTTP client with connection pooling (HTTP/1.1 only) ──────────
+app = FastAPI(title="Shopify Checker API", lifespan=lifespan)
+
+# ─── HTTP client with connection pooling ──────────────────────────
 client = httpx.AsyncClient(
     timeout=httpx.Timeout(30.0, connect=10.0),
     limits=httpx.Limits(max_keepalive_connections=100, max_connections=200),
@@ -27,17 +36,6 @@ def extract_cc(cc: str):
     if len(parts) != 4:
         raise ValueError("Invalid card format. Use: number|month|year|cvv")
     return parts[0], parts[1], parts[2], parts[3]
-
-def get_brand(card_number: str) -> str:
-    if card_number.startswith("4"):
-        return "visa"
-    if card_number.startswith(("51", "52", "53", "54", "55")):
-        return "mastercard"
-    if card_number.startswith(("34", "37")):
-        return "amex"
-    if card_number.startswith("6011") or card_number.startswith("65"):
-        return "discover"
-    return "unknown"
 
 def format_proxy(proxy: Optional[str]) -> Optional[str]:
     if not proxy:
@@ -94,7 +92,6 @@ async def check_site(site: str, card_number: str, month: str, year: str, cvv: st
             return {"status": "error", "message": "Failed to load checkout", "price": "-", "gateway": "Shopify"}
         html = resp.text
 
-        # Extract authenticity token
         token_match = re.search(r'name="authenticity_token" value="([^"]+)"', html)
         if not token_match:
             return {"status": "error", "message": "Authenticity token not found", "price": "-", "gateway": "Shopify"}
@@ -181,10 +178,6 @@ async def shopify_check(
 @app.get("/")
 async def health():
     return {"status": "ok", "service": "Shopify Checker API"}
-
-@app.on_event("shutdown")
-async def shutdown():
-    await client.aclose()
 
 if __name__ == "__main__":
     import uvicorn
